@@ -1,47 +1,31 @@
 #include "dcl.h"
 
-// HLS top-level function
-void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
-                data_t C_DRAM[N_ROWS][N_COLS]) {
-
-    // Moving DRAM interfaces to BRAM
-    #pragma HLS interface m_axi port=A_DRAM offset=slave bundle=A max_read_burst_length=256 num_read_outstanding=16
-    #pragma HLS interface m_axi port=C_DRAM offset=slave bundle=C max_write_burst_length=256 num_write_outstanding=16
-    #pragma HLS interface s_axilite port=return
-
-    // On-chip buffers for A_DRAM and C_DRAM
-    data_t A[N_ROWS][N_COLS];
-    data_t C[N_ROWS][N_COLS];
-    // Array Partitioning: 'A' and 'C' are partitioned on Dimension 2 (Columns) to enable parallel access during row-wise loop operations for Phase 1.
-    #pragma HLS ARRAY_PARTITION variable=A dim=2 type=complete
-    #pragma HLS ARRAY_PARTITION variable=C dim=2 type=complete
-
+// Helper function for Burst Reads
+void read_input(data_t A_DRAM[N_ROWS][N_COLS], data_t A[N_ROWS][N_COLS]) {
     for (int i = 0; i < N_ROWS; i++) {
+        #pragma HLS PIPELINE II=1 // Loop Pipelining: Set Initiation Interval to 1 to start new iteration every clock cycle
         for (int j = 0; j < N_COLS; j++) {
-            #pragma HLS PIPELINE II=1 // Loop Pipelining: Set Initiation Interval to 1 to start new iteration every clock cycle
-            #pragma HLS LOOP_FLATTEN // Loop Flattening: Flatten nested loops to improve pipeline efficiency
-            // #pragma HLS UNROLL factor=64 // Loop Unrolling: Unroll loop to process elements in parallel
-
             A[i][j] = A_DRAM[i][j];
-
-            // We may be able to read faster if we increase AXI bus width
         }
     }
+}
 
-
-
-    // Intermediate buffer for row-normalized values
+void process_kernel(data_t A[N_ROWS][N_COLS], data_t C[N_ROWS][N_COLS]) {
     data_t tmp[N_ROWS][N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=tmp dim=2 type=complete // Array Partitioning: 'tmp' is partitioned on both dimensions to enable parallel access during both row and column wise operatios for Phases 1 and 2.
+    #pragma HLS ARRAY_PARTITION variable=tmp dim=2 type=complete // Array Partitioning: 'tmp' is partitioned to enable parallel access during loop operations.
+    
+    data_t col_sums[N_COLS] = {0};
+    #pragma HLS ARRAY_PARTITION variable=col_sums type=complete // Array Partitioning: 'col_sums' is partitioned to enable parallel access during loop operations.
 
     // Phase 1: Row-wise normalization
     for (int i = 0; i < N_ROWS; i++) {
+        #pragma HLS PIPELINE II=1 // Loop Pipelining: Set Initiation Interval to 1 to start new iteration every clock cycle
+
         data_t row_sum = 0.0;
 
-        // Compute row sum
+        // Compute row sum with unrolling to allow an adder tree
         for (int j = 0; j < N_COLS; j++) {
-            #pragma HLS PIPELINE II=1 // Loop Pipelining: Set Initiation Interval to 1 to start new iteration every clock cycle
-            #pragma HLS UNROLL factor=64 // Loop Unrolling: Unroll loop to process elements in parallel
+            #pragma HLS UNROLL factor=64
 
             row_sum += A[i][j];
         }
@@ -49,53 +33,52 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
         // Avoid division by zero, add small bias
         data_t denom = row_sum + (data_t)1.0;
 
-        // Normalize each element in the row
         for (int j = 0; j < N_COLS; j++) {
             #pragma HLS PIPELINE II=1 // Loop Pipelining: Set Initiation Interval to 1 to start new iteration every clock cycle
-            #pragma HLS UNROLL factor=64 // Loop Unrolling: Unroll loop to process elements in parallel
+            #pragma HLS UNROLL factor=16 // Partial unroll to balance division latency
 
             tmp[i][j] = A[i][j] / denom;
+            col_sums[j] += tmp[i][j]; // Accumulate col_sum here to save a loop!
         }
     }
-    
 
+    // Phase 2: Column scaling and final result
 
-    // Phase 2: Column-wise scaling
+    data_t scales[N_COLS] = {0};
+    #pragma HLS ARRAY_PARTITION variable=scales type=complete // Array Partitioning: 'scales' is partitioned to enable parallel access during loop operations.
 
-    // Buffer to hold running sums for all columns
-    data_t col_sums[N_COLS];
-
-    // Array Partitioning: 'col_sums' is partitioned to enable parallel access during loop operations.
-    #pragma HLS ARRAY_PARTITION variable=col_sums type=complete
-
-    // Initialize sums
-    for(int j=0; j<N_COLS; j++) {
+    for (int j = 0; j < N_COLS; j++) {
         #pragma HLS PIPELINE II=1 // Loop Pipelining: Set Initiation Interval to 1 to start new iteration every clock cycle
-        #pragma HLS UNROLL factor=64 // Loop Unrolling: Unroll loop to process elements in parallel
+        #pragma HLS UNROLL factor=16 // Partial unroll to balance division latency
 
-        col_sums[j] = 0;
+        scales[j] = col_sums[j] / (data_t)N_ROWS;
     }
 
-    // Loop Reordering: Perform row-column traversal for improved memory access locality
     for (int i = 0; i < N_ROWS; i++) {
-        for (int j = 0; j < N_COLS; j++) {
-            #pragma HLS PIPELINE II=1 // Loop Pipelining: Set Initiation Interval to 1 to start new iteration every clock cycle
-            #pragma HLS UNROLL factor=64 // Loop Unrolling: Unroll loop to process elements in parallel
+        #pragma HLS PIPELINE II=1 // Loop Pipelining: Set Initiation Interval to 1 to start new iteration every clock cycle
 
-            col_sums[j] += tmp[i][j]; 
+        for (int j = 0; j < N_COLS; j++) {
+            #pragma HLS UNROLL factor=64
+
+            C[i][j] = tmp[i][j] * scales[j];
         }
     }
+}
 
-    // Final Scale Calculation and Write
-    for (int i = 0; i < N_ROWS; i++) {
-        for (int j = 0; j < N_COLS; j++) {
-            #pragma HLS PIPELINE II=1 // Loop Pipelining: Set Initiation Interval to 1 to start new iteration every clock cycle
-            #pragma HLS UNROLL factor=64 // Loop Unrolling: Unroll loop to process elements in parallel
+void top_kernel(data_t A_DRAM[N_ROWS][N_COLS], data_t C_DRAM[N_ROWS][N_COLS]) {
+    #pragma HLS INTERFACE m_axi port=A_DRAM offset=slave bundle=A
+    #pragma HLS INTERFACE m_axi port=C_DRAM offset=slave bundle=C
+    #pragma HLS INTERFACE s_axilite port=return
 
-            data_t scale = col_sums[j] / (data_t)N_ROWS;
-            C[i][j] = tmp[i][j] * scale;
-        }
-    }
+    data_t A[N_ROWS][N_COLS];
+    data_t C[N_ROWS][N_COLS];
+    #pragma HLS ARRAY_PARTITION variable=A dim=2 type=complete // Array Partitioning: 'A' is partitioned to enable parallel access during loop operations.
+    #pragma HLS ARRAY_PARTITION variable=C dim=2 type=complete // Array Partitioning: 'C' is partitioned to enable parallel access during loop operations.
+
+    #pragma HLS DATAFLOW
+
+    read_input(A_DRAM, A);
+    process_kernel(A, C);
 
     // Write back results to DRAM
     for (int i = 0; i < N_ROWS; i++) {
@@ -107,5 +90,4 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
             // We may be able to write back faster if we increase AXI bus width
         }
     }
-
 }
