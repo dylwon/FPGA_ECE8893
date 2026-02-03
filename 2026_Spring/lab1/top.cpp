@@ -30,16 +30,6 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
     data_t tmp[N_ROWS][N_COLS];
     #pragma HLS ARRAY_PARTITION variable=tmp dim=2 type=complete // Array Partitioning: 'tmp' is partitioned on both dimensions to enable parallel access during both row and column wise operatios for Phases 1 and 2.
 
-    data_t col_sums[N_COLS]; // Buffer to hold running sums for all columns
-    #pragma HLS ARRAY_PARTITION variable=col_sums type=complete // Array Partitioning: 'col_sums' is partitioned to enable parallel access during loop operations.
-
-    // Initialize sums
-    for(int j=0; j<N_COLS; j++) {
-        #pragma HLS UNROLL factor=64 // Loop Unrolling: Unroll loop to process elements in parallel
-
-        col_sums[j] = 0;
-    }
-
     data_t denoms[N_ROWS]; // Buffer to hold calculated denominators for all columns
     #pragma HLS ARRAY_PARTITION variable=denoms type=complete // Array Partitioning: 'denoms' is partitioned to enable parallel access during loop operations.
 
@@ -64,9 +54,30 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
     for (int i = 0; i < N_ROWS; i++) {
         for (int j = 0; j < N_COLS; j++) {
             #pragma HLS PIPELINE II=1 // Loop Pipelining Inner Loop: Partial Unrolling to allow overlapping of operations
-            #pragma HLS UNROLL factor=32 // Loop Unrolling: Unroll loop to process elements in parallel
+            #pragma HLS UNROLL factor=8 // Loop Unrolling: Unroll loop to process elements in parallel
 
             tmp[i][j] = A[i][j] / denoms[i];
+        }
+    }
+
+    data_t col_sums[N_COLS]; // Buffer to hold running sums for all columns
+    #pragma HLS ARRAY_PARTITION variable=col_sums type=complete // Array Partitioning: 'col_sums' is partitioned to enable parallel access during loop operations.
+
+    // Initialize sums
+    for(int j=0; j<N_COLS; j++) {
+        #pragma HLS UNROLL factor=64 // Loop Unrolling: Unroll loop to process elements in parallel
+
+        col_sums[j] = 0;
+    }
+
+    // Row-Col Wise Accumulation
+    for (int i = 0; i < N_ROWS; i++) {
+        #pragma HLS PIPELINE II=1
+        
+        for (int j = 0; j < N_COLS; j++) {
+            #pragma HLS UNROLL factor=64
+            #pragma HLS DEPENDENCE variable=col_sums inter false
+
             col_sums[j] += tmp[i][j];
         }
     }
@@ -78,7 +89,7 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
 
     for(int j=0; j<N_COLS; j++){
         #pragma HLS PIPELINE II=1 // Loop Pipelining Inner Loop: Partial Unrolling to allow overlapping of operations
-        #pragma HLS UNROLL factor=32
+        #pragma HLS UNROLL factor=8
 
         scales[j] = col_sums[j] / (data_t)N_ROWS;
     }
