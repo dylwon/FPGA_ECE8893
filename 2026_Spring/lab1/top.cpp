@@ -52,11 +52,14 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
 
     // Normalize each element in the row
     for (int i = 0; i < N_ROWS; i++) {
+
+        data_t denom = denoms[i];
+
         for (int j = 0; j < N_COLS; j++) {
             #pragma HLS PIPELINE II=1 // Loop Pipelining Inner Loop: Partial Unrolling to allow overlapping of operations
-            #pragma HLS UNROLL factor=8 // Loop Unrolling: Unroll loop to process elements in parallel
+            #pragma HLS UNROLL factor=16 // Loop Unrolling: Unroll loop to process elements in parallel
 
-            tmp[i][j] = A[i][j] / denoms[i];
+            tmp[i][j] = A[i][j] / denom;
         }
     }
 
@@ -89,7 +92,7 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
 
     for(int j=0; j<N_COLS; j++){
         #pragma HLS PIPELINE II=1 // Loop Pipelining Inner Loop: Partial Unrolling to allow overlapping of operations
-        #pragma HLS UNROLL factor=8
+        #pragma HLS UNROLL factor=16
 
         scales[j] = col_sums[j] / (data_t)N_ROWS;
     }
