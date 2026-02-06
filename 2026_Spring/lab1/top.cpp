@@ -23,22 +23,22 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
     // LOCAL BUFFERS (Partitioned for Vector Access)
     // -------------------------------------------------------------
     data_t A[N_ROWS][N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=A dim=2 type=cyclic factor=16
+    #pragma HLS ARRAY_PARTITION variable=A dim=2 type=complete
 
     data_t C[N_ROWS][N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=C dim=2 type=cyclic factor=16
+    #pragma HLS ARRAY_PARTITION variable=C dim=2 type=complete
 
     data_t tmp[N_ROWS][N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=tmp dim=2 type=cyclic factor=16
+    #pragma HLS ARRAY_PARTITION variable=tmp dim=2 type=complete
 
     data_t denoms[N_ROWS];
     // No partition needed, accessed sequentially
 
     data_t col_sums[N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=col_sums type=cyclic factor=16
+    #pragma HLS ARRAY_PARTITION variable=col_sums type=complete
 
     data_t scales[N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=scales type=cyclic factor=16
+    #pragma HLS ARRAY_PARTITION variable=scales type=complete
 
     // -------------------------------------------------------------
     // STAGE 1: Vectorized Read (Bit-Exact Copy)
@@ -52,11 +52,8 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
             
             // Unpack exactly 16 values
             for (int k = 0; k < 16; k++) {
-                #pragma HLS UNROLL
+                #pragma HLS UNROLL factor=16
                 
-                // CRITICAL FIX: Use .range() to copy BITS, not value.
-                // This prevents HLS from trying to convert integer '5' to fixed '5.0'
-                // We assume data_t is aligned to 32-bit boundaries in DRAM.
                 ap_int<32> raw_bits = raw.range(31 + k*32, k*32);
                 
                 // Copy the bottom 24 bits (width of data_t) directly
@@ -73,20 +70,16 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
         
         data_t row_sum = 0;
         for (int j = 0; j < N_COLS; j++) {
-            // Keep original unroll factor to match original adder tree structure
-            #pragma HLS UNROLL factor=64 
             row_sum += A[i][j];
         }
         
-        // CRITICAL FIX: REVERT TO ADDITION
-        // Do NOT calculate reciprocal (1.0/x) here. 
-        // We must store the exact denominator to use in Division later.
         denoms[i] = row_sum + (data_t)1.0;
     }
 
     // Initialize Accumulators
-    for(int j=0; j<N_COLS; j++) {
-        #pragma HLS UNROLL factor=16
+    for (int j = 0; j < N_COLS; j++) {
+        #pragma HLS UNROLL factor=64
+
         col_sums[j] = 0;
     }
 
@@ -96,7 +89,7 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
     COL_PROCESS: for (int i = 0; i < N_ROWS; i++) {
         data_t denom = denoms[i];
 
-        for (int j = 0; j < N_COLS; j+=16) {
+        for (int j = 0; j < N_COLS; j += 16) {
             #pragma HLS PIPELINE II=1
             
             for (int k = 0; k < 16; k++) {
@@ -104,7 +97,7 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
             }
 
             for (int k = 0; k < 16; k++) {
-                col_sums[j+k] += val;
+                col_sums[j+k] += tmp[i][j+k];
             }
         }
     }
@@ -112,11 +105,12 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
     // -------------------------------------------------------------
     // STAGE 4: Compute Scales (Using DIVISION)
     // -------------------------------------------------------------
-    COMPUTE_SCALES: for(int j=0; j<N_COLS; j++){
+    COMPUTE_SCALES: for (int j = 0; j < N_COLS; j += 16) {
         #pragma HLS PIPELINE II=1
-        #pragma HLS UNROLL factor=16
-        // Bit-exact division matches original code
-        scales[j] = col_sums[j] / (data_t)N_ROWS; 
+
+        for (int k = 0; k < 16; k++) {
+            scales[j + k] = col_sums[j + k] / (data_t)N_ROWS; 
+        }
     }
 
     // -------------------------------------------------------------
@@ -131,17 +125,17 @@ void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
             for (int k = 0; k < 16; k++) {
                 #pragma HLS UNROLL
                 
-                // Perform math
+                // FIX: Reconstruct column index (j*16 + k)
                 data_t res = tmp[i][j*16 + k] * scales[j*16 + k];
                 
                 // Pack bits directly using .range()
-                // Do not cast to float or int, just copy the container bits
                 ap_int<32> out_bits = 0;
                 out_bits.range(23, 0) = res.range(23, 0);
                 
                 raw_out.range(31 + k*32, k*32) = out_bits;
             }
             
+            // Correct Indexing: j is now 0, 1, 2...
             C_wide[i*(N_COLS/16) + j] = raw_out;
         }
     }
