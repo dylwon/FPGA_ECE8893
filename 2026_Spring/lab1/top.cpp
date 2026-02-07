@@ -1,142 +1,101 @@
 #include "dcl.h"
-#include <ap_int.h>
 
-// 1. Define Vector Type (16 elements * 32-bit alignment = 512 bits)
-// Note: Even though data_t is 24 bits, HLS aligns it to 32 bits in memory.
-typedef ap_uint<512> uint512_dt;
-
+// HLS top-level function
 void top_kernel(data_t A_DRAM[N_ROWS][N_COLS],
                 data_t C_DRAM[N_ROWS][N_COLS]) {
 
-    // -------------------------------------------------------------
-    // INTERFACE: Keep Arguments Unchanged, use Internal Casting
-    // -------------------------------------------------------------
-    #pragma HLS interface m_axi port=A_DRAM offset=slave bundle=A max_read_burst_length=32 num_read_outstanding=16
-    #pragma HLS interface m_axi port=C_DRAM offset=slave bundle=C max_write_burst_length=32 num_write_outstanding=16
+    // Moving DRAM interfaces to BRAM
+    #pragma HLS interface m_axi port=A_DRAM offset=slave bundle=A max_read_burst_length=256 num_read_outstanding=16
+    #pragma HLS interface m_axi port=C_DRAM offset=slave bundle=C max_write_burst_length=256 num_write_outstanding=16
     #pragma HLS interface s_axilite port=return
 
-    // Internal Shadow Pointers for 512-bit access
-    uint512_dt* A_wide = (uint512_dt*)A_DRAM;
-    uint512_dt* C_wide = (uint512_dt*)C_DRAM;
-
-    // -------------------------------------------------------------
-    // LOCAL BUFFERS (Partitioned for Vector Access)
-    // -------------------------------------------------------------
+    // On-chip buffers for A_DRAM and C_DRAM
     data_t A[N_ROWS][N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=A dim=2 type=complete
+    #pragma HLS ARRAY_PARTITION variable=A dim=2 type=cyclic factor=16
 
     data_t C[N_ROWS][N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=C dim=2 type=complete
+    #pragma HLS ARRAY_PARTITION variable=C dim=2 type=cyclic factor=16
 
-    data_t tmp[N_ROWS][N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=tmp dim=2 type=complete
+    A_BRAM_WRITE: for (int i = 0; i < N_ROWS; i++) {
+        #pragma HLS PIPELINE II=1
 
-    data_t denoms[N_ROWS];
-    // No partition needed, accessed sequentially
-
-    data_t col_sums[N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=col_sums type=complete
-
-    data_t scales[N_COLS];
-    #pragma HLS ARRAY_PARTITION variable=scales type=complete
-
-    // -------------------------------------------------------------
-    // STAGE 1: Vectorized Read (Bit-Exact Copy)
-    // -------------------------------------------------------------
-    READ_LOOP: for (int i = 0; i < N_ROWS; i++) {
-        for (int j = 0; j < N_COLS / 16; j++) {
-            #pragma HLS PIPELINE II=1
-            
-            // Read 512 raw bits
-            uint512_dt raw = A_wide[i*(N_COLS/16) + j];
-            
-            // Unpack exactly 16 values
-            for (int k = 0; k < 16; k++) {
-                #pragma HLS UNROLL factor=16
-                
-                ap_int<32> raw_bits = raw.range(31 + k*32, k*32);
-                
-                // Copy the bottom 24 bits (width of data_t) directly
-                A[i][j*16 + k].range(23, 0) = raw_bits.range(23, 0);
-            }
+        for (int j = 0; j < N_COLS; j++) {
+            A[i][j] = A_DRAM[i][j];
         }
     }
 
-    // -------------------------------------------------------------
-    // STAGE 2: Row Sums & Denom Calculation
-    // -------------------------------------------------------------
-    ROW_PROCESS: for (int i = 0; i < N_ROWS; i++) {
+    // Intermediate buffer for row-normalized values
+    data_t tmp[N_ROWS][N_COLS];
+    #pragma HLS ARRAY_PARTITION variable=tmp dim=2 type=cyclic factor=16
+
+    // Buffer to hold calculated denominators for all columns
+    data_t denoms[N_ROWS]; 
+    #pragma HLS ARRAY_PARTITION variable=denoms type=cyclic factor=16
+
+    // Phase 1: Row-wise normalization
+    ROW_SUMS: for (int i = 0; i < N_ROWS; i++) {
         #pragma HLS PIPELINE II=1
-        
-        data_t row_sum = 0;
+
+        data_t row_sum = 0.0;
+
+        // Compute row sum
         for (int j = 0; j < N_COLS; j++) {
             row_sum += A[i][j];
         }
-        
+
+        // Avoid division by zero, add small bias
         denoms[i] = row_sum + (data_t)1.0;
     }
 
-    // Initialize Accumulators
-    for (int j = 0; j < N_COLS; j++) {
-        #pragma HLS UNROLL factor=64
+    // Buffer to hold running sums for all columns
+    data_t col_sums[N_COLS]; 
+    #pragma HLS ARRAY_PARTITION variable=col_sums type=cyclic factor=16
+
+    // Initialize sums
+    INIT_COL_SUMS: for (int j = 0; j < N_COLS; j++) {
+        #pragma HLS UNROLL factor=16
 
         col_sums[j] = 0;
     }
 
-    // -------------------------------------------------------------
-    // STAGE 3: Tiled Normalization (Using DIVISION)
-    // -------------------------------------------------------------
-    COL_PROCESS: for (int i = 0; i < N_ROWS; i++) {
+    // Normalize each element in the row
+    COL_SUMS: for (int i = 0; i < N_ROWS; i++) {
         data_t denom = denoms[i];
 
         for (int j = 0; j < N_COLS; j += 16) {
             #pragma HLS PIPELINE II=1
-            
+
             for (int k = 0; k < 16; k++) {
-                tmp[i][j+k] = A[i][j+k] / denom;
+                tmp[i][j + k] = A[i][j + k] / denom;
             }
 
             for (int k = 0; k < 16; k++) {
-                col_sums[j+k] += tmp[i][j+k];
+                col_sums[j + k] += tmp[i][j + k];
             }
         }
     }
 
-    // -------------------------------------------------------------
-    // STAGE 4: Compute Scales (Using DIVISION)
-    // -------------------------------------------------------------
-    COMPUTE_SCALES: for (int j = 0; j < N_COLS; j += 16) {
+    // Phase 2: Column-wise scaling
+    data_t scales[N_COLS];
+    #pragma HLS ARRAY_PARTITION variable=scales type=cyclic factor=16
+
+    SCALE_NORMALIZE: for (int j = 0; j < N_COLS; j += 16) {
         #pragma HLS PIPELINE II=1
 
         for (int k = 0; k < 16; k++) {
-            scales[j + k] = col_sums[j + k] / (data_t)N_ROWS; 
+            scales[j + k] = col_sums[j + k] / (data_t)N_ROWS;
         }
     }
 
-    // -------------------------------------------------------------
-    // STAGE 5: Vectorized Write Back (Bit-Exact Copy)
-    // -------------------------------------------------------------
-    WRITE_LOOP: for (int i = 0; i < N_ROWS; i++) {
-        for (int j = 0; j < N_COLS / 16; j++) {
+    // Write back results to DRAM
+    C_DRAM_WRITE: for (int i = 0; i < N_ROWS; i++) {
+
+        for (int j = 0; j < N_COLS; j += 16) {
             #pragma HLS PIPELINE II=1
-            
-            uint512_dt raw_out;
-            
+
             for (int k = 0; k < 16; k++) {
-                #pragma HLS UNROLL
-                
-                // FIX: Reconstruct column index (j*16 + k)
-                data_t res = tmp[i][j*16 + k] * scales[j*16 + k];
-                
-                // Pack bits directly using .range()
-                ap_int<32> out_bits = 0;
-                out_bits.range(23, 0) = res.range(23, 0);
-                
-                raw_out.range(31 + k*32, k*32) = out_bits;
+                C_DRAM[i][j + k] = tmp[i][j + k] * scales[j + k];
             }
-            
-            // Correct Indexing: j is now 0, 1, 2...
-            C_wide[i*(N_COLS/16) + j] = raw_out;
         }
     }
 }
