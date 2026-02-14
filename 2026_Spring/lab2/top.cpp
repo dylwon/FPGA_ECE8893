@@ -1,7 +1,7 @@
 #include "dcl.h"
 #include <hls_stream.h>
 
-#define TILE_FACTOR 32
+#define TILE_FACTOR 16
 
 struct data_block_t {
     data_t val[TILE_FACTOR];
@@ -31,9 +31,7 @@ void compute_stencil(hls::stream<data_block_t>& in_stream, hls::stream<data_bloc
     static data_t buf0[NX][NY];
     static data_t buf1[NX][NY];
 
-    #pragma HLS ARRAY_PARTITION variable=buf0 dim=1 cyclic factor=4
     #pragma HLS ARRAY_PARTITION variable=buf0 dim=2 cyclic factor=32
-    #pragma HLS ARRAY_PARTITION variable=buf1 dim=1 cyclic factor=4
     #pragma HLS ARRAY_PARTITION variable=buf1 dim=2 cyclic factor=32
 
     const data_t wc = (data_t)0.50;
