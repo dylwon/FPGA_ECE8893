@@ -1,38 +1,43 @@
 #include "dcl.h"
 #include <hls_stream.h>
+#include <ap_int.h>
 
-#define TILE_FACTOR 16
+#define TILE_FACTOR 8
 
-struct data_block_t {
-    data_t val[TILE_FACTOR];
-};
+typedef ap_uint<256> uint256_dt;
 
-void read_input(const data_t A_in[NX][NY], hls::stream<data_block_t>& in_stream) {
+void read_input(const data_t A_in[NX][NY], hls::stream<uint256_dt>& in_stream) {
     #pragma HLS INLINE off
 
     read_row: for (int i = 0; i < NX; i++) {
         read_col: for (int j = 0; j < NY; j += TILE_FACTOR) {
             #pragma HLS PIPELINE II=1
             
-            data_block_t block;
-            #pragma HLS ARRAY_PARTITION variable=block.val complete
-            
+            uint256_dt block_val;
+
             read_inner: for (int jj = 0; jj < TILE_FACTOR; jj++) {
-                block.val[jj] = A_in[i][j + jj];
+                #pragma HLS UNROLL
+                data_t temp = A_in[i][j + jj];
+                int low = jj * 32;
+                int high = low + 31;
+                block_val.range(high, low) = *(ap_uint<32>*)&temp;
             }
-            in_stream.write(block);
+            in_stream.write(block_val);
         }
     }
 }
 
-void compute_stencil(hls::stream<data_block_t>& in_stream, hls::stream<data_block_t>& out_stream) {
+void compute_stencil(hls::stream<uint256_dt>& in_stream, hls::stream<uint256_dt>& out_stream) {
     #pragma HLS INLINE off
 
     static data_t buf0[NX][NY];
     static data_t buf1[NX][NY];
 
-    #pragma HLS ARRAY_PARTITION variable=buf0 dim=2 cyclic factor=32
-    #pragma HLS ARRAY_PARTITION variable=buf1 dim=2 cyclic factor=32
+    #pragma HLS ARRAY_PARTITION variable=buf0 dim=1 cyclic factor=2
+    #pragma HLS ARRAY_PARTITION variable=buf0 dim=2 cyclic factor=8
+
+    #pragma HLS ARRAY_PARTITION variable=buf1 dim=1 cyclic factor=2
+    #pragma HLS ARRAY_PARTITION variable=buf1 dim=2 cyclic factor=8
 
     const data_t wc = (data_t)0.50;
     const data_t wa = (data_t)0.10;
@@ -42,11 +47,14 @@ void compute_stencil(hls::stream<data_block_t>& in_stream, hls::stream<data_bloc
         load_col: for (int j = 0; j < NY; j += TILE_FACTOR) {
             #pragma HLS PIPELINE II=1
             
-            data_block_t block = in_stream.read();
+            uint256_dt block_val = in_stream.read();
             
             load_inner: for (int jj = 0; jj < TILE_FACTOR; jj++) {
                 #pragma HLS UNROLL
-                buf0[i][j + jj] = block.val[jj];
+                int low = jj * 32;
+                int high = low + 31;
+                ap_uint<32> temp_int = block_val.range(high, low);
+                buf0[i][j + jj] = *(data_t*)&temp_int;
             }
         }
     }
@@ -54,7 +62,6 @@ void compute_stencil(hls::stream<data_block_t>& in_stream, hls::stream<data_bloc
     time_loop: for (int t = 0; t < TSTEPS; t++) {
         
         if (t % 2 == 0) {
-            
             boundary_row_even: for (int j = 0; j < NY; j += TILE_FACTOR) {
                 #pragma HLS PIPELINE II=1
                 for (int jj = 0; jj < TILE_FACTOR; jj++) {
@@ -82,20 +89,11 @@ void compute_stencil(hls::stream<data_block_t>& in_stream, hls::stream<data_bloc
 
                         if (j + jj > 0 && j + jj < NY - 1) {
                             int j_idx = j + jj;
-                            int j_minus = j_idx - 1;
-                            int j_plus  = j_idx + 1;
-
-                            acc_t sum_axis =
-                                (acc_t)buf0[i - 1][j_idx] + (acc_t)buf0[i + 1][j_idx] +
-                                (acc_t)buf0[i][j_minus] + (acc_t)buf0[i][j_plus];
-
-                            acc_t sum_diag =
-                                (acc_t)buf0[i - 1][j_minus] + (acc_t)buf0[i - 1][j_plus] +
-                                (acc_t)buf0[i + 1][j_minus] + (acc_t)buf0[i + 1][j_plus];
-
-                            acc_t center = (acc_t)buf0[i][j_idx];
-                            
-                            acc_t out = (acc_t)wc * center + (acc_t)wa * sum_axis + (acc_t)wd * sum_diag;
+                            acc_t sum_axis = (acc_t)buf0[i - 1][j_idx] + (acc_t)buf0[i + 1][j_idx] +
+                                             (acc_t)buf0[i][j_idx - 1] + (acc_t)buf0[i][j_idx + 1];
+                            acc_t sum_diag = (acc_t)buf0[i - 1][j_idx - 1] + (acc_t)buf0[i - 1][j_idx + 1] +
+                                             (acc_t)buf0[i + 1][j_idx - 1] + (acc_t)buf0[i + 1][j_idx + 1];
+                            acc_t out = (acc_t)wc * buf0[i][j_idx] + (acc_t)wa * sum_axis + (acc_t)wd * sum_diag;
                             buf1[i][j_idx] = (data_t)out;
                         }
                     } 
@@ -103,7 +101,6 @@ void compute_stencil(hls::stream<data_block_t>& in_stream, hls::stream<data_bloc
             }
         }
         else {
-            
             boundary_row_odd: for (int j = 0; j < NY; j += TILE_FACTOR) {
                 #pragma HLS PIPELINE II=1
                 for (int jj = 0; jj < TILE_FACTOR; jj++) {
@@ -131,20 +128,11 @@ void compute_stencil(hls::stream<data_block_t>& in_stream, hls::stream<data_bloc
 
                         if (j + jj > 0 && j + jj < NY - 1) {
                             int j_idx = j + jj;
-                            int j_minus = j_idx - 1;
-                            int j_plus  = j_idx + 1;
-
-                            acc_t sum_axis =
-                                (acc_t)buf1[i - 1][j_idx] + (acc_t)buf1[i + 1][j_idx] +
-                                (acc_t)buf1[i][j_minus] + (acc_t)buf1[i][j_plus];
-
-                            acc_t sum_diag =
-                                (acc_t)buf1[i - 1][j_minus] + (acc_t)buf1[i - 1][j_plus] +
-                                (acc_t)buf1[i + 1][j_minus] + (acc_t)buf1[i + 1][j_plus];
-
-                            acc_t center = (acc_t)buf1[i][j_idx];
-                            
-                            acc_t out = (acc_t)wc * center + (acc_t)wa * sum_axis + (acc_t)wd * sum_diag;
+                            acc_t sum_axis = (acc_t)buf1[i - 1][j_idx] + (acc_t)buf1[i + 1][j_idx] +
+                                             (acc_t)buf1[i][j_idx - 1] + (acc_t)buf1[i][j_idx + 1];
+                            acc_t sum_diag = (acc_t)buf1[i - 1][j_idx - 1] + (acc_t)buf1[i - 1][j_idx + 1] +
+                                             (acc_t)buf1[i + 1][j_idx - 1] + (acc_t)buf1[i + 1][j_idx + 1];
+                            acc_t out = (acc_t)wc * buf1[i][j_idx] + (acc_t)wa * sum_axis + (acc_t)wd * sum_diag;
                             buf0[i][j_idx] = (data_t)out;
                         }
                     } 
@@ -159,43 +147,49 @@ void compute_stencil(hls::stream<data_block_t>& in_stream, hls::stream<data_bloc
         store_col: for (int j = 0; j < NY; j += TILE_FACTOR) {
             #pragma HLS PIPELINE II=1
             
-            data_block_t block;
-            #pragma HLS ARRAY_PARTITION variable=block.val complete
-
+            uint256_dt block_val;
+            
             store_inner: for (int jj = 0; jj < TILE_FACTOR; jj++) {
                 #pragma HLS UNROLL
-                block.val[jj] = buf1_select ? buf1[i][j + jj] : buf0[i][j + jj];
+                data_t temp = buf1_select ? buf1[i][j + jj] : buf0[i][j + jj];
+                int low = jj * 32;
+                int high = low + 31;
+                block_val.range(high, low) = *(ap_uint<32>*)&temp;
             }
-            out_stream.write(block);
+            out_stream.write(block_val);
         }
     }
 }
 
-void write_output(hls::stream<data_block_t>& out_stream, data_t A_out[NX][NY]) {
+void write_output(hls::stream<uint256_dt>& out_stream, data_t A_out[NX][NY]) {
     #pragma HLS INLINE off
 
     write_row: for (int i = 0; i < NX; i++) {
         write_col: for (int j = 0; j < NY; j += TILE_FACTOR) {
             #pragma HLS PIPELINE II=1
             
-            data_block_t block = out_stream.read();
+            uint256_dt block_val = out_stream.read();
 
             write_inner: for (int jj = 0; jj < TILE_FACTOR; jj++) {
-                A_out[i][j + jj] = block.val[jj];
+                #pragma HLS UNROLL
+                int low = jj * 32;
+                int high = low + 31;
+                ap_uint<32> temp_int = block_val.range(high, low);
+                A_out[i][j + jj] = *(data_t*)&temp_int;
             }
         }
     }
 }
 
 void top_kernel(const data_t A_in[NX][NY], data_t A_out[NX][NY]) {
-    #pragma HLS interface m_axi port=A_in offset=slave bundle=A_in
-    #pragma HLS interface m_axi port=A_out offset=slave bundle=A_out
+    #pragma HLS interface m_axi port=A_in offset=slave bundle=A_in max_read_burst_length=128 num_read_outstanding=16
+    #pragma HLS interface m_axi port=A_out offset=slave bundle=A_out max_write_burst_length=128 num_write_outstanding=16
     #pragma HLS interface s_axilite port=return
 
     #pragma HLS DATAFLOW
     
-    hls::stream<data_block_t> in_stream("input_stream");
-    hls::stream<data_block_t> out_stream("output_stream");
+    hls::stream<uint256_dt> in_stream("input_stream");
+    hls::stream<uint256_dt> out_stream("output_stream");
     
     #pragma HLS STREAM variable=in_stream depth=2
     #pragma HLS STREAM variable=out_stream depth=2
