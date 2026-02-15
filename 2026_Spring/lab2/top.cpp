@@ -24,10 +24,10 @@ void compute_stencil(hls::stream<uint256_dt>& in_stream, hls::stream<uint256_dt>
     static data_t buf0[NX][NY];
     static data_t buf1[NX][NY];
 
-    #pragma HLS ARRAY_PARTITION variable=buf0 dim=1 cyclic factor=2
+    #pragma HLS ARRAY_PARTITION variable=buf0 dim=1 cyclic factor=4
     #pragma HLS ARRAY_PARTITION variable=buf0 dim=2 cyclic factor=8
 
-    #pragma HLS ARRAY_PARTITION variable=buf1 dim=1 cyclic factor=2
+    #pragma HLS ARRAY_PARTITION variable=buf1 dim=1 cyclic factor=4
     #pragma HLS ARRAY_PARTITION variable=buf1 dim=2 cyclic factor=8
 
     const data_t wc = (data_t)0.50;
