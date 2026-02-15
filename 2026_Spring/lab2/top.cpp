@@ -9,21 +9,12 @@ typedef ap_uint<256> uint256_dt;
 void read_input(const data_t A_in[NX][NY], hls::stream<uint256_dt>& in_stream) {
     #pragma HLS INLINE off
 
-    read_row: for (int i = 0; i < NX; i++) {
-        read_col: for (int j = 0; j < NY; j += TILE_FACTOR) {
-            #pragma HLS PIPELINE II=1
-            
-            uint256_dt block_val;
+    const uint256_dt* in_ptr = (const uint256_dt*)A_in;
+    int total_blocks = (NX * NY) / TILE_FACTOR;
 
-            read_inner: for (int jj = 0; jj < TILE_FACTOR; jj++) {
-                #pragma HLS UNROLL
-                data_t temp = A_in[i][j + jj];
-                int low = jj * 32;
-                int high = low + 31;
-                block_val.range(high, low) = *(ap_uint<32>*)&temp;
-            }
-            in_stream.write(block_val);
-        }
+    read_loop: for (int i = 0; i < total_blocks; i++) {
+        #pragma HLS PIPELINE II=1
+        in_stream.write(in_ptr[i]);
     }
 }
 
@@ -164,26 +155,18 @@ void compute_stencil(hls::stream<uint256_dt>& in_stream, hls::stream<uint256_dt>
 void write_output(hls::stream<uint256_dt>& out_stream, data_t A_out[NX][NY]) {
     #pragma HLS INLINE off
 
-    write_row: for (int i = 0; i < NX; i++) {
-        write_col: for (int j = 0; j < NY; j += TILE_FACTOR) {
-            #pragma HLS PIPELINE II=1
-            
-            uint256_dt block_val = out_stream.read();
+    uint256_dt* out_ptr = (uint256_dt*)A_out;
+    int total_blocks = (NX * NY) / TILE_FACTOR;
 
-            write_inner: for (int jj = 0; jj < TILE_FACTOR; jj++) {
-                #pragma HLS UNROLL
-                int low = jj * 32;
-                int high = low + 31;
-                ap_uint<32> temp_int = block_val.range(high, low);
-                A_out[i][j + jj] = *(data_t*)&temp_int;
-            }
-        }
+    write_loop: for (int i = 0; i < total_blocks; i++) {
+        #pragma HLS PIPELINE II=1
+        out_ptr[i] = out_stream.read();
     }
 }
 
 void top_kernel(const data_t A_in[NX][NY], data_t A_out[NX][NY]) {
-    #pragma HLS interface m_axi port=A_in offset=slave bundle=A_in max_read_burst_length=128 num_read_outstanding=16
-    #pragma HLS interface m_axi port=A_out offset=slave bundle=A_out max_write_burst_length=128 num_write_outstanding=16
+    #pragma HLS interface m_axi port=A_in offset=slave bundle=A_in max_read_burst_length=256 num_read_outstanding=32
+    #pragma HLS interface m_axi port=A_out offset=slave bundle=A_out max_write_burst_length=256 num_write_outstanding=32
     #pragma HLS interface s_axilite port=return
 
     #pragma HLS DATAFLOW
@@ -191,8 +174,8 @@ void top_kernel(const data_t A_in[NX][NY], data_t A_out[NX][NY]) {
     hls::stream<uint256_dt> in_stream("input_stream");
     hls::stream<uint256_dt> out_stream("output_stream");
     
-    #pragma HLS STREAM variable=in_stream depth=2
-    #pragma HLS STREAM variable=out_stream depth=2
+    #pragma HLS STREAM variable=in_stream depth=64
+    #pragma HLS STREAM variable=out_stream depth=64
 
     read_input(A_in, in_stream);
     compute_stencil(in_stream, out_stream);
