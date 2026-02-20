@@ -2,182 +2,179 @@
 #include <hls_stream.h>
 #include <ap_int.h>
 
-#define TILE_FACTOR 8
+// Maximize AXI4 Bus Width: 512 bits = 16 * 32-bit elements
+#define TILE_FACTOR 16
+#define VEC_COLS (NY / TILE_FACTOR)
+#define TOTAL_BLOCKS (NX * VEC_COLS)
 
-typedef ap_uint<256> uint256_dt;
+typedef ap_uint<512> uint512_dt;
 
-void read_input(const data_t A_in[NX][NY], hls::stream<uint256_dt>& in_stream) {
+// --------------------------------------------------------
+// TASK 1: Burst Read 512-bit Vectors from DDR
+// --------------------------------------------------------
+void load_data(const data_t A_in[NX][NY], hls::stream<uint512_dt>& out_stream) {
     #pragma HLS INLINE off
-
-    const uint256_dt* in_ptr = (const uint256_dt*)A_in;
-    int total_blocks = (NX * NY) / TILE_FACTOR;
-
-    read_loop: for (int i = 0; i < total_blocks; i++) {
+    const uint512_dt* in_ptr = (const uint512_dt*)A_in;
+    
+    load_loop: for (int i = 0; i < TOTAL_BLOCKS; i++) {
         #pragma HLS PIPELINE II=1
-        in_stream.write(in_ptr[i]);
+        out_stream.write(in_ptr[i]);
     }
 }
 
-void compute_stencil(hls::stream<uint256_dt>& in_stream, hls::stream<uint256_dt>& out_stream) {
+// --------------------------------------------------------
+// TASK 2: 30-Step Compute Engine (16-wide Vectorization)
+// --------------------------------------------------------
+void process_data(hls::stream<uint512_dt>& in_stream, hls::stream<uint512_dt>& out_stream) {
     #pragma HLS INLINE off
+    
+    uint512_dt buf_work[2][TOTAL_BLOCKS];
+    #pragma HLS BIND_STORAGE variable=buf_work type=ram_2p impl=bram
 
-    static data_t buf0[NX][NY];
-    static data_t buf1[NX][NY];
+    uint512_dt line_buf0[VEC_COLS];
+    uint512_dt line_buf1[VEC_COLS];
+    #pragma HLS BIND_STORAGE variable=line_buf0 type=ram_2p impl=bram
+    #pragma HLS BIND_STORAGE variable=line_buf1 type=ram_2p impl=bram
 
-    #pragma HLS ARRAY_PARTITION variable=buf0 dim=1 cyclic factor=4
-    #pragma HLS ARRAY_PARTITION variable=buf0 dim=2 cyclic factor=8
-
-    #pragma HLS ARRAY_PARTITION variable=buf1 dim=1 cyclic factor=4
-    #pragma HLS ARRAY_PARTITION variable=buf1 dim=2 cyclic factor=8
+    // Widened 3x48 Window (Prev 16, Curr 16, Next 16)
+    data_t window[3][48];
+    #pragma HLS ARRAY_PARTITION variable=window dim=0 complete
 
     const data_t wc = (data_t)0.50;
     const data_t wa = (data_t)0.10;
     const data_t wd = (data_t)0.025;
 
-    load_row: for (int i = 0; i < NX; i++) {
-        load_col: for (int j = 0; j < NY; j += TILE_FACTOR) {
-            #pragma HLS PIPELINE II=1
-            
-            uint256_dt block_val = in_stream.read();
-            
-            load_inner: for (int jj = 0; jj < TILE_FACTOR; jj++) {
-                #pragma HLS UNROLL
-                int low = jj * 32;
-                int high = low + 31;
-                ap_uint<32> temp_int = block_val.range(high, low);
-                buf0[i][j + jj] = *(data_t*)&temp_int;
-            }
-        }
-    }
+    int total_iterations = (NX + 1) * (VEC_COLS + 1);
 
     time_loop: for (int t = 0; t < TSTEPS; t++) {
-        
-        if (t % 2 == 0) {
-            boundary_row_even: for (int j = 0; j < NY; j += TILE_FACTOR) {
-                #pragma HLS PIPELINE II=1
-                for (int jj = 0; jj < TILE_FACTOR; jj++) {
-                    #pragma HLS UNROLL
-                    buf1[0][j + jj] = buf0[0][j + jj];
-                    buf1[NX - 1][j + jj] = buf0[NX - 1][j + jj];
-                }   
-            }
+        bool wr_idx = t % 2;
+        bool rd_idx = !wr_idx;
 
-            boundary_col_even: for (int i = 0; i < NX; i += TILE_FACTOR) {
-                #pragma HLS PIPELINE II=1
-                for (int ii = 0; ii < TILE_FACTOR; ii++) {
-                    #pragma HLS UNROLL
-                    buf1[i + ii][0] = buf0[i + ii][0];
-                    buf1[i + ii][NY - 1] = buf0[i + ii][NY - 1];
-                }
-            }
-
-            compute_i_even: for (int i = 1; i < NX - 1; i++) {
-                compute_j_even: for (int j = 0; j < NY; j += TILE_FACTOR) {
-                    #pragma HLS PIPELINE II=1
-
-                    for (int jj = 0; jj < TILE_FACTOR; jj++) {
-                        #pragma HLS UNROLL
-
-                        if (j + jj > 0 && j + jj < NY - 1) {
-                            int j_idx = j + jj;
-                            acc_t sum_axis = (acc_t)buf0[i - 1][j_idx] + (acc_t)buf0[i + 1][j_idx] +
-                                             (acc_t)buf0[i][j_idx - 1] + (acc_t)buf0[i][j_idx + 1];
-                            acc_t sum_diag = (acc_t)buf0[i - 1][j_idx - 1] + (acc_t)buf0[i - 1][j_idx + 1] +
-                                             (acc_t)buf0[i + 1][j_idx - 1] + (acc_t)buf0[i + 1][j_idx + 1];
-                            acc_t out = (acc_t)wc * buf0[i][j_idx] + (acc_t)wa * sum_axis + (acc_t)wd * sum_diag;
-                            buf1[i][j_idx] = (data_t)out;
-                        }
-                    } 
-                }
-            }
-        }
-        else {
-            boundary_row_odd: for (int j = 0; j < NY; j += TILE_FACTOR) {
-                #pragma HLS PIPELINE II=1
-                for (int jj = 0; jj < TILE_FACTOR; jj++) {
-                    #pragma HLS UNROLL
-                    buf0[0][j + jj] = buf1[0][j + jj];
-                    buf0[NX - 1][j + jj] = buf1[NX - 1][j + jj];
-                }   
-            }
-
-            boundary_col_odd: for (int i = 0; i < NX; i += TILE_FACTOR) {
-                #pragma HLS PIPELINE II=1
-                for (int ii = 0; ii < TILE_FACTOR; ii++) {
-                    #pragma HLS UNROLL
-                    buf0[i + ii][0] = buf1[i + ii][0];
-                    buf0[i + ii][NY - 1] = buf1[i + ii][NY - 1];
-                }
-            }
-
-            compute_i_odd: for (int i = 1; i < NX - 1; i++) {
-                compute_j_odd: for (int j = 0; j < NY; j += TILE_FACTOR) {
-                    #pragma HLS PIPELINE II=1
-
-                    for (int jj = 0; jj < TILE_FACTOR; jj++) {
-                        #pragma HLS UNROLL
-
-                        if (j + jj > 0 && j + jj < NY - 1) {
-                            int j_idx = j + jj;
-                            acc_t sum_axis = (acc_t)buf1[i - 1][j_idx] + (acc_t)buf1[i + 1][j_idx] +
-                                             (acc_t)buf1[i][j_idx - 1] + (acc_t)buf1[i][j_idx + 1];
-                            acc_t sum_diag = (acc_t)buf1[i - 1][j_idx - 1] + (acc_t)buf1[i - 1][j_idx + 1] +
-                                             (acc_t)buf1[i + 1][j_idx - 1] + (acc_t)buf1[i + 1][j_idx + 1];
-                            acc_t out = (acc_t)wc * buf1[i][j_idx] + (acc_t)wa * sum_axis + (acc_t)wd * sum_diag;
-                            buf0[i][j_idx] = (data_t)out;
-                        }
-                    } 
-                }
-            }
-        }
-    }
-
-    bool buf1_select = (TSTEPS % 2 != 0);
-    
-    store_row: for (int i = 0; i < NX; i++) {
-        store_col: for (int j = 0; j < NY; j += TILE_FACTOR) {
+        step_loop: for (int step = 0; step < total_iterations; step++) {
             #pragma HLS PIPELINE II=1
             
-            uint256_dt block_val;
+            int i_loop = step / (VEC_COLS + 1);
+            int j_loop = step % (VEC_COLS + 1);
             
-            store_inner: for (int jj = 0; jj < TILE_FACTOR; jj++) {
+            int out_i = i_loop - 1;
+            int out_j = j_loop - 1;
+            int linear_idx_in = i_loop * VEC_COLS + j_loop;
+            int linear_idx_out = out_i * VEC_COLS + out_j;
+
+            // Step A: Shift Window Left by 16 elements
+            for (int r = 0; r < 3; r++) {
                 #pragma HLS UNROLL
-                data_t temp = buf1_select ? buf1[i][j + jj] : buf0[i][j + jj];
-                int low = jj * 32;
-                int high = low + 31;
-                block_val.range(high, low) = *(ap_uint<32>*)&temp;
+                for (int c = 0; c < 32; c++) {
+                    #pragma HLS UNROLL
+                    window[r][c] = window[r][c + 16];
+                }
             }
-            out_stream.write(block_val);
+
+            // Step B: Read Data (Stream on first step, internal Ping-Pong otherwise)
+            uint512_dt in_val = 0;
+            if (i_loop < NX && j_loop < VEC_COLS) {
+                if (t == 0) {
+                    in_val = in_stream.read(); 
+                } else {
+                    in_val = buf_work[rd_idx][linear_idx_in];
+                }
+            }
+
+            uint512_dt lb1_val = 0, lb0_val = 0;
+            if (j_loop < VEC_COLS) {
+                lb1_val = line_buf1[j_loop];
+                lb0_val = line_buf0[j_loop];
+            }
+
+            // Step C: Update Line Buffers
+            if (i_loop < NX && j_loop < VEC_COLS) {
+                line_buf1[j_loop] = in_val;
+                line_buf0[j_loop] = lb1_val;
+            }
+
+            // Step D: Unpack into the right side of the window (Indices 32 to 47)
+            for (int k = 0; k < TILE_FACTOR; k++) {
+                #pragma HLS UNROLL
+                int low = k * 32;
+                int high = low + 31;
+                
+                ap_uint<32> val_bot = in_val.range(high, low);
+                ap_uint<32> val_mid = lb1_val.range(high, low);
+                ap_uint<32> val_top = lb0_val.range(high, low);
+
+                window[2][32 + k] = *(data_t*)&val_bot;
+                window[1][32 + k] = *(data_t*)&val_mid;
+                window[0][32 + k] = *(data_t*)&val_top;
+            }
+
+            // Step E: Compute Output (Center vector is Indices 16 to 31)
+            if (out_i >= 0 && out_i < NX && out_j >= 0 && out_j < VEC_COLS) {
+                uint512_dt out_block;
+                
+                for (int k = 0; k < TILE_FACTOR; k++) {
+                    #pragma HLS UNROLL
+                    int j_real = out_j * TILE_FACTOR + k;
+                    data_t result;
+                    
+                    if (out_i == 0 || out_i == NX - 1 || j_real == 0 || j_real == NY - 1) {
+                        result = window[1][16 + k]; 
+                    } else {
+                        acc_t sum_axis = ((acc_t)window[0][16 + k] + (acc_t)window[2][16 + k]) +
+                                         ((acc_t)window[1][16 + k - 1] + (acc_t)window[1][16 + k + 1]);
+                                         
+                        acc_t sum_diag = ((acc_t)window[0][16 + k - 1] + (acc_t)window[0][16 + k + 1]) +
+                                         ((acc_t)window[2][16 + k - 1] + (acc_t)window[2][16 + k + 1]);
+                                         
+                        result = (data_t)((acc_t)wc * window[1][16 + k] + (acc_t)wa * sum_axis + (acc_t)wd * sum_diag);
+                    }
+                    
+                    int low = k * 32;
+                    int high = low + 31;
+                    out_block.range(high, low) = *(ap_uint<32>*)&result;
+                }
+
+                // Step F: Write Data (Stream on final step, Ping-Pong otherwise)
+                if (t == TSTEPS - 1) {
+                    out_stream.write(out_block);
+                } else {
+                    buf_work[wr_idx][linear_idx_out] = out_block;
+                }
+            }
         }
     }
 }
 
-void write_output(hls::stream<uint256_dt>& out_stream, data_t A_out[NX][NY]) {
+// --------------------------------------------------------
+// TASK 3: Burst Write 512-bit Vectors to DDR
+// --------------------------------------------------------
+void store_data(hls::stream<uint512_dt>& in_stream, data_t A_out[NX][NY]) {
     #pragma HLS INLINE off
-
-    uint256_dt* out_ptr = (uint256_dt*)A_out;
-    int total_blocks = (NX * NY) / TILE_FACTOR;
-
-    write_loop: for (int i = 0; i < total_blocks; i++) {
+    uint512_dt* out_ptr = (uint512_dt*)A_out;
+    
+    store_loop: for (int i = 0; i < TOTAL_BLOCKS; i++) {
         #pragma HLS PIPELINE II=1
-        out_ptr[i] = out_stream.read();
+        out_ptr[i] = in_stream.read();
     }
 }
 
+// --------------------------------------------------------
+// TOP KERNEL
+// --------------------------------------------------------
 void top_kernel(const data_t A_in[NX][NY], data_t A_out[NX][NY]) {
-    #pragma HLS interface m_axi port=A_in offset=slave bundle=A_in max_read_burst_length=256 num_read_outstanding=32
-    #pragma HLS interface m_axi port=A_out offset=slave bundle=A_out max_write_burst_length=256 num_write_outstanding=32
+    // AXI Memory Mapped Interfaces for DDR
+    #pragma HLS interface m_axi port=A_in offset=slave bundle=gmem0 max_read_burst_length=256 max_widen_bitwidth=512
+    #pragma HLS interface m_axi port=A_out offset=slave bundle=gmem1 max_write_burst_length=256 max_widen_bitwidth=512
     #pragma HLS interface s_axilite port=return
 
-    #pragma HLS DATAFLOW
-    
-    hls::stream<uint256_dt> in_stream("input_stream");
-    hls::stream<uint256_dt> out_stream("output_stream");
-    
-    #pragma HLS STREAM variable=in_stream depth=64
-    #pragma HLS STREAM variable=out_stream depth=64
+    // Internal FIFOs for Task-Level Pipelining
+    hls::stream<uint512_dt> in_stream("in_stream");
+    hls::stream<uint512_dt> out_stream("out_stream");
+    #pragma HLS STREAM variable=in_stream depth=16
+    #pragma HLS STREAM variable=out_stream depth=16
 
-    read_input(A_in, in_stream);
-    compute_stencil(in_stream, out_stream);
-    write_output(out_stream, A_out);
+    #pragma HLS DATAFLOW
+
+    load_data(A_in, in_stream);
+    process_data(in_stream, out_stream);
+    store_data(out_stream, A_out);
 }
