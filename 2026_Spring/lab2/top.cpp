@@ -25,7 +25,7 @@ void load_data(const data_t A_in[NX][NY], hls::stream<uint256_dt>& out_stream) {
 // --------------------------------------------------------
 // TASK 2: Parameterized N-Stage Systolic Compute Engine
 // --------------------------------------------------------
-#define STAGES 6
+#define STAGES 10
 
 void process_data(hls::stream<uint256_dt>& in_stream, hls::stream<uint256_dt>& out_stream) {
     #pragma HLS INLINE off
