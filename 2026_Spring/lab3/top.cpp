@@ -23,47 +23,38 @@ static inline data_t clamp_fp(data_t x, data_t lo, data_t hi) {
 }
 
 // --------------------------------------------------------
-// K0: Load, Preprocess, and Split Stream (II=1 Burst)
+// K0: Load, Preprocess, and Split Stream (Unified 512-bit Burst)
 // --------------------------------------------------------
 void load_and_K0(const data_t in[N], hls::stream<uint512_dt>& out_k1, hls::stream<uint512_dt>& out_k2) {
     #pragma HLS INLINE off
     const coef_t alpha = (coef_t)0.875;
     const coef_t beta  = (coef_t)0.125;
 
-#ifndef __SYNTHESIS__
-    load_loop_sim: for (int i = 0; i < VEC_N; i++) {
-        uint512_dt out_block = 0;
-        for (int k = 0; k < TILE_FACTOR; k++) {
-            data_t val = in[i * TILE_FACTOR + k];
-            data_t s0_val = (data_t)((acc_t)alpha * (acc_t)val + (acc_t)beta);
-            ap_uint<32> tmp_out = s0_val.range(); 
-            out_block(k * 32 + 31, k * 32) = tmp_out;
-        }
-        out_k1.write(out_block);
-        out_k2.write(out_block);
-    }
-#else
+    // Because data_t is exactly 32-bits, this cast is 100% safe in both C-Sim and HW Synthesis!
     const uint512_dt* in_ptr = (const uint512_dt*)in;
     
-    load_loop_hw: for (int i = 0; i < VEC_N; i++) {
+    load_loop: for (int i = 0; i < VEC_N; i++) {
         #pragma HLS PIPELINE II=1
-        uint512_dt block = in_ptr[i];
+        
+        // Reads 16 pixels (512 bits) in exactly 1 clock cycle
+        uint512_dt block = in_ptr[i]; 
         uint512_dt out_block = 0;
 
         for (int k = 0; k < TILE_FACTOR; k++) {
             #pragma HLS UNROLL
             ap_uint<32> tmp_in = block(k * 32 + 31, k * 32);
             data_t val;
-            val.range() = tmp_in;
+            
+            // Safely maps the 32 bits directly into the ap_fixed<32, 6> object
+            val.range() = tmp_in; 
             
             data_t s0_val = (data_t)((acc_t)alpha * (acc_t)val + (acc_t)beta);
-            ap_uint<32> tmp_out = s0_val.range(); 
-            out_block(k * 32 + 31, k * 32) = tmp_out;
+            
+            out_block(k * 32 + 31, k * 32) = s0_val.range(); 
         }
         out_k1.write(out_block);
         out_k2.write(out_block);
     }
-#endif
 }
 
 // --------------------------------------------------------
@@ -181,28 +172,17 @@ void K3_normalize(hls::stream<uint512_dt>& in_stream, hls::stream<stat_t>& stat_
 }
 
 // --------------------------------------------------------
-// K4: Postprocess and Store (II=1 Burst)
+// K4: Postprocess and Store (Unified 512-bit Burst)
 // --------------------------------------------------------
 void K4_and_store(hls::stream<uint512_dt>& in_stream, data_t out[N]) {
     #pragma HLS INLINE off
     const coef_t gamma = (coef_t)1.25;
     const coef_t delta = (coef_t)0.05;
 
-#ifndef __SYNTHESIS__
-    k4_loop_sim: for (int i = 0; i < VEC_N; i++) {
-        uint512_dt block = in_stream.read();
-        for (int k = 0; k < TILE_FACTOR; k++) {
-            ap_uint<32> tmp = block(k * 32 + 31, k * 32);
-            data_t val;
-            val.range() = tmp;
-            data_t z = (data_t)((acc_t)gamma * (acc_t)val + (acc_t)delta);
-            out[i * TILE_FACTOR + k] = clamp_fp(z, (data_t)0, (data_t)7.9);
-        }
-    }
-#else
+    // Safe, unified memory cast for perfectly aligned 32-bit types
     uint512_dt* out_ptr = (uint512_dt*)out;
     
-    k4_loop_hw: for (int i = 0; i < VEC_N; i++) {
+    k4_loop: for (int i = 0; i < VEC_N; i++) {
         #pragma HLS PIPELINE II=1
         uint512_dt block = in_stream.read();
         uint512_dt write_block = 0;
@@ -216,12 +196,12 @@ void K4_and_store(hls::stream<uint512_dt>& in_stream, data_t out[N]) {
             data_t z = (data_t)((acc_t)gamma * (acc_t)val + (acc_t)delta);
             data_t clamped = clamp_fp(z, (data_t)0, (data_t)7.9);
             
-            ap_uint<32> out_tmp = clamped.range();
-            write_block(k * 32 + 31, k * 32) = out_tmp;
+            write_block(k * 32 + 31, k * 32) = clamped.range();
         }
-        out_ptr[i] = write_block;
+        
+        // Writes 16 pixels (512 bits) back to DDR in exactly 1 clock cycle
+        out_ptr[i] = write_block; 
     }
-#endif
 }
 
 // --------------------------------------------------------
