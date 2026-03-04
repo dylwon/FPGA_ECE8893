@@ -112,22 +112,19 @@ void K1_transform(hls::stream<uint1024_dt>& in_stream, hls::stream<uint1024_dt>&
             acc_t m1 = (acc_t)w1 * (acc_t)x1;
             acc_t m2 = (acc_t)w2 * (acc_t)x2;
 
-            // 2. Add pipeline registers to the fabric adders to break the logic chain!
             acc_t sum1 = m0 + m1;
             #pragma HLS BIND_OP variable=sum1 op=add impl=fabric latency=1
             
             acc_t acc  = sum1 + m2;
             #pragma HLS BIND_OP variable=acc op=add impl=fabric latency=1
             
-            // Break the chain: register the absolute value BEFORE clamping
-            data_t abs_val;
-            #pragma HLS LATENCY min=1 max=1
-            abs_val = abs_fp((data_t)acc);
-            
+            // Force a hard 2-cycle routing break before the heavy clamp logic
             data_t y;
-            #pragma HLS LATENCY min=1 max=1
-            y = clamp_fp(abs_val, (data_t)0, (data_t)7.5);
-
+            {
+                #pragma HLS LATENCY min=2 max=2
+                data_t abs_val = abs_fp((data_t)acc);
+                y = clamp_fp(abs_val, (data_t)0, (data_t)7.5);
+            }
             out_block(k * 32 + 31, k * 32) = y.range();
         }
         out_stream.write(out_block);
@@ -282,14 +279,15 @@ void top_kernel(const data_t in[N], data_t out[N]) {
     #pragma HLS STREAM variable=stream_final depth=8
 
     hls::stream<uint1024_dt> stream_s0_to_k1("stream_s0_to_k1");
-    #pragma HLS STREAM variable=stream_s0_to_k1 depth=16
+    #pragma HLS STREAM variable=stream_s0_to_k1 depth=4
+    #pragma HLS BIND_STORAGE variable=stream_s0_to_k1 type=fifo impl=srl
 
     hls::stream<uint1024_dt> stream_s0_to_k2("stream_s0_to_k2");
     #pragma HLS STREAM variable=stream_s0_to_k2 depth=16
 
-    // The Deadlock Eliminator: Buffer sized for the entire image block load to absorb divider latency
     hls::stream<uint1024_dt> stream_s1("stream_s1");
     #pragma HLS STREAM variable=stream_s1 depth=4096
+    #pragma HLS BIND_STORAGE variable=stream_s1 type=fifo impl=bram
 
     hls::stream<stat_t> stream_stat("stream_stat");
     #pragma HLS STREAM variable=stream_stat depth=16
