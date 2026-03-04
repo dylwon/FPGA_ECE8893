@@ -2,13 +2,12 @@
 #include <hls_stream.h>
 #include <ap_int.h>
 
-// 512-bit bus / 32-bit padded elements = 16 elements per clock cycle!
-#define TILE_FACTOR 16
+#define TILE_FACTOR 32
 #define VEC_N (N / TILE_FACTOR)
 #define VEC_BLOCK (BLOCK / TILE_FACTOR)
 
-// The massive 512-bit data type
-typedef ap_uint<512> uint512_dt;
+// The new Dual-Fetch data type
+typedef ap_uint<1024> uint1024_dt;
 
 static inline data_t abs_fp(data_t x) {
     #pragma HLS INLINE
@@ -23,32 +22,43 @@ static inline data_t clamp_fp(data_t x, data_t lo, data_t hi) {
 }
 
 // --------------------------------------------------------
-// K0: Load, Preprocess, and Split Stream (Unified 512-bit Burst)
+// 1. PURE AXI READ (Decoupled from Math)
 // --------------------------------------------------------
-void load_and_K0(const data_t in[N], hls::stream<uint512_dt>& out_k1, hls::stream<uint512_dt>& out_k2) {
+void read_in(const data_t in[N], hls::stream<uint1024_dt>& raw_stream) {
+    #pragma HLS INLINE off
+    const uint1024_dt* in_ptr = (const uint1024_dt*)in;
+    
+    read_loop: for (int i = 0; i < VEC_N; i++) {
+        #pragma HLS PIPELINE II=1
+        raw_stream.write(in_ptr[i]); 
+    }
+}
+
+// --------------------------------------------------------
+// 2. K0: Preprocess and Split Streams (Pipelined Math)
+// --------------------------------------------------------
+void K0_preprocess(hls::stream<uint1024_dt>& raw_stream, hls::stream<uint1024_dt>& out_k1, hls::stream<uint1024_dt>& out_k2) {
     #pragma HLS INLINE off
     const coef_t alpha = (coef_t)0.875;
     const coef_t beta  = (coef_t)0.125;
 
-    // Because data_t is exactly 32-bits, this cast is 100% safe in both C-Sim and HW Synthesis!
-    const uint512_dt* in_ptr = (const uint512_dt*)in;
-    
-    load_loop: for (int i = 0; i < VEC_N; i++) {
+    k0_loop: for (int i = 0; i < VEC_N; i++) {
         #pragma HLS PIPELINE II=1
-        
-        // Reads 16 pixels (512 bits) in exactly 1 clock cycle
-        uint512_dt block = in_ptr[i]; 
-        uint512_dt out_block = 0;
+        uint1024_dt block = raw_stream.read(); 
+        uint1024_dt out_block = 0;
 
         for (int k = 0; k < TILE_FACTOR; k++) {
             #pragma HLS UNROLL
             ap_uint<32> tmp_in = block(k * 32 + 31, k * 32);
             data_t val;
-            
-            // Safely maps the 32 bits directly into the ap_fixed<32, 6> object
             val.range() = tmp_in; 
             
-            data_t s0_val = (data_t)((acc_t)alpha * (acc_t)val + (acc_t)beta);
+            // Pipelined Math to save clock period slack
+            acc_t mul_alpha = (acc_t)alpha * (acc_t)val;
+            #pragma HLS BIND_OP variable=mul_alpha op=mul impl=dsp latency=2
+            
+            data_t s0_val = (data_t)(mul_alpha + (acc_t)beta);
+            #pragma HLS BIND_OP variable=s0_val op=add impl=fabric latency=1
             
             out_block(k * 32 + 31, k * 32) = s0_val.range(); 
         }
@@ -58,9 +68,9 @@ void load_and_K0(const data_t in[N], hls::stream<uint512_dt>& out_k1, hls::strea
 }
 
 // --------------------------------------------------------
-// K1: Transform (Branchless 1D Sliding Window)
+// K1: Transform Branchless Sliding Window (Bit-Shift Optimized)
 // --------------------------------------------------------
-void K1_transform(hls::stream<uint512_dt>& in_stream, hls::stream<uint512_dt>& out_stream) {
+void K1_transform(hls::stream<uint1024_dt>& in_stream, hls::stream<uint1024_dt>& out_stream) {
     #pragma HLS INLINE off
     const coef_t w0 = (coef_t)0.50;
     const coef_t w1 = (coef_t)(-0.25);
@@ -71,8 +81,8 @@ void K1_transform(hls::stream<uint512_dt>& in_stream, hls::stream<uint512_dt>& o
 
     k1_loop: for (int i = 0; i < VEC_N; i++) {
         #pragma HLS PIPELINE II=1
-        uint512_dt block = in_stream.read();
-        uint512_dt out_block = 0;
+        uint1024_dt block = in_stream.read();
+        uint1024_dt out_block = 0;
 
         data_t window[TILE_FACTOR + 2];
         #pragma HLS ARRAY_PARTITION variable=window complete
@@ -97,27 +107,45 @@ void K1_transform(hls::stream<uint512_dt>& in_stream, hls::stream<uint512_dt>& o
             data_t x1 = window[k + 1];
             data_t x2 = window[k];
 
-            acc_t acc = (acc_t)w0 * (acc_t)x0 + (acc_t)w1 * (acc_t)x1 + (acc_t)w2 * (acc_t)x2;
-            data_t y = clamp_fp(abs_fp((data_t)acc), (data_t)0, (data_t)7.5);
+            // 1. Let the compiler infer 0-delay bit-shifts for powers of 2!
+            acc_t m0 = (acc_t)w0 * (acc_t)x0;
+            acc_t m1 = (acc_t)w1 * (acc_t)x1;
+            acc_t m2 = (acc_t)w2 * (acc_t)x2;
 
-            ap_uint<32> tmp_out = y.range();
-            out_block(k * 32 + 31, k * 32) = tmp_out;
+            // 2. Add pipeline registers to the fabric adders to break the logic chain!
+            acc_t sum1 = m0 + m1;
+            #pragma HLS BIND_OP variable=sum1 op=add impl=fabric latency=1
+            
+            acc_t acc  = sum1 + m2;
+            #pragma HLS BIND_OP variable=acc op=add impl=fabric latency=1
+            
+            // Break the chain: register the absolute value BEFORE clamping
+            data_t abs_val;
+            #pragma HLS LATENCY min=1 max=1
+            abs_val = abs_fp((data_t)acc);
+            
+            data_t y;
+            #pragma HLS LATENCY min=1 max=1
+            y = clamp_fp(abs_val, (data_t)0, (data_t)7.5);
+
+            out_block(k * 32 + 31, k * 32) = y.range();
         }
         out_stream.write(out_block);
     }
 }
 
 // --------------------------------------------------------
-// K2: Per-Block Statistic Accumulator (FLATTENED)
+// K2: Per-Block Statistic (Clean C++ with Pipelined Tree)
 // --------------------------------------------------------
-void K2_statistics(hls::stream<uint512_dt>& in_stream, hls::stream<stat_t>& stat_stream) {
+void K2_statistics(hls::stream<uint1024_dt>& in_stream, hls::stream<stat_t>& stat_stream) {
     #pragma HLS INLINE off
     const stat_t eps = (stat_t)0.5;
     acc_t sum_abs = 0;
 
     k2_loop: for (int i = 0; i < VEC_N; i++) {
         #pragma HLS PIPELINE II=1
-        uint512_dt block = in_stream.read();
+        uint1024_dt block = in_stream.read();
+        
         acc_t local_sum = 0;
 
         for (int k = 0; k < TILE_FACTOR; k++) {
@@ -127,6 +155,9 @@ void K2_statistics(hls::stream<uint512_dt>& in_stream, hls::stream<stat_t>& stat
             val.range() = tmp;
             local_sum += (acc_t)abs_fp(val);
         }
+        
+        // Force 4 pipeline registers inside the 32-input tree!
+        #pragma HLS BIND_OP variable=local_sum op=add impl=fabric latency=4
         
         sum_abs += local_sum;
 
@@ -139,22 +170,39 @@ void K2_statistics(hls::stream<uint512_dt>& in_stream, hls::stream<stat_t>& stat
 }
 
 // --------------------------------------------------------
-// K3: Join and Normalize (FLATTENED)
+// 5. K3A: Isolated Hardware Divider
 // --------------------------------------------------------
-void K3_normalize(hls::stream<uint512_dt>& in_stream, hls::stream<stat_t>& stat_stream, hls::stream<uint512_dt>& out_stream) {
+void K3A_divide(hls::stream<stat_t>& stat_stream, hls::stream<stat_t>& inv_stat_stream) {
+    #pragma HLS INLINE off
+    
+    divide_loop: for (int b = 0; b < (N / BLOCK); b++) {
+        #pragma HLS PIPELINE II=1
+        
+        stat_t st = stat_stream.read();
+        
+        // Let Vitis HLS auto-infer the best pipelined architecture for this division
+        stat_t inv_st = (stat_t)((acc_t)1 / (acc_t)st);
+        
+        inv_stat_stream.write(inv_st);
+    }
+}
+
+// --------------------------------------------------------
+// 6. K3B: Join and Normalize (Pipelined Math)
+// --------------------------------------------------------
+void K3B_normalize(hls::stream<uint1024_dt>& in_stream, hls::stream<stat_t>& inv_stat_stream, hls::stream<uint1024_dt>& out_stream) {
     #pragma HLS INLINE off
     stat_t inv_st = 0;
 
-    k3_loop: for (int i = 0; i < VEC_N; i++) {
+    k3b_loop: for (int i = 0; i < VEC_N; i++) {
         #pragma HLS PIPELINE II=1
         
         if (i % VEC_BLOCK == 0) {
-            stat_t st = stat_stream.read();
-            inv_st = (stat_t)((acc_t)1 / (acc_t)st);
+            inv_st = inv_stat_stream.read();
         }
 
-        uint512_dt block = in_stream.read();
-        uint512_dt out_block = 0;
+        uint1024_dt block = in_stream.read();
+        uint1024_dt out_block = 0;
 
         for (int k = 0; k < TILE_FACTOR; k++) {
             #pragma HLS UNROLL
@@ -162,30 +210,28 @@ void K3_normalize(hls::stream<uint512_dt>& in_stream, hls::stream<stat_t>& stat_
             data_t val;
             val.range() = tmp;
 
+            // Pipelined multiplier
             data_t norm_val = (data_t)((acc_t)val * (acc_t)inv_st);
+            #pragma HLS BIND_OP variable=norm_val op=mul impl=dsp latency=2
 
-            ap_uint<32> tmp_out = norm_val.range();
-            out_block(k * 32 + 31, k * 32) = tmp_out;
+            out_block(k * 32 + 31, k * 32) = norm_val.range();
         }
         out_stream.write(out_block);
     }
 }
 
 // --------------------------------------------------------
-// K4: Postprocess and Store (Unified 512-bit Burst)
+// 7. K4: Postprocess (Pipelined Math)
 // --------------------------------------------------------
-void K4_and_store(hls::stream<uint512_dt>& in_stream, data_t out[N]) {
+void K4_postprocess(hls::stream<uint1024_dt>& in_stream, hls::stream<uint1024_dt>& out_stream) {
     #pragma HLS INLINE off
     const coef_t gamma = (coef_t)1.25;
     const coef_t delta = (coef_t)0.05;
 
-    // Safe, unified memory cast for perfectly aligned 32-bit types
-    uint512_dt* out_ptr = (uint512_dt*)out;
-    
     k4_loop: for (int i = 0; i < VEC_N; i++) {
         #pragma HLS PIPELINE II=1
-        uint512_dt block = in_stream.read();
-        uint512_dt write_block = 0;
+        uint1024_dt block = in_stream.read();
+        uint1024_dt write_block = 0;
 
         for (int k = 0; k < TILE_FACTOR; k++) {
             #pragma HLS UNROLL
@@ -193,14 +239,30 @@ void K4_and_store(hls::stream<uint512_dt>& in_stream, data_t out[N]) {
             data_t val;
             val.range() = tmp;
             
-            data_t z = (data_t)((acc_t)gamma * (acc_t)val + (acc_t)delta);
-            data_t clamped = clamp_fp(z, (data_t)0, (data_t)7.9);
+            // Pipelined Math
+            acc_t mul_gamma = (acc_t)gamma * (acc_t)val;
+            #pragma HLS BIND_OP variable=mul_gamma op=mul impl=dsp latency=2
             
+            data_t z = (data_t)(mul_gamma + (acc_t)delta);
+            #pragma HLS BIND_OP variable=z op=add impl=fabric latency=1
+
+            data_t clamped = clamp_fp(z, (data_t)0, (data_t)7.9);
             write_block(k * 32 + 31, k * 32) = clamped.range();
         }
-        
-        // Writes 16 pixels (512 bits) back to DDR in exactly 1 clock cycle
-        out_ptr[i] = write_block; 
+        out_stream.write(write_block); 
+    }
+}
+
+// --------------------------------------------------------
+// 8. PURE AXI WRITE (Decoupled from Math)
+// --------------------------------------------------------
+void write_out(hls::stream<uint1024_dt>& final_stream, data_t out[N]) {
+    #pragma HLS INLINE off
+    uint1024_dt* out_ptr = (uint1024_dt*)out;
+    
+    write_loop: for (int i = 0; i < VEC_N; i++) {
+        #pragma HLS PIPELINE II=1
+        out_ptr[i] = final_stream.read(); 
     }
 }
 
@@ -208,33 +270,47 @@ void K4_and_store(hls::stream<uint512_dt>& in_stream, data_t out[N]) {
 // TOP KERNEL
 // --------------------------------------------------------
 void top_kernel(const data_t in[N], data_t out[N]) {
-    // Upgraded AXI configuration to 512 bits!
-    #pragma HLS interface m_axi port=in offset=slave bundle=gmem0 max_read_burst_length=256 num_read_outstanding=4 max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=out offset=slave bundle=gmem1 max_write_burst_length=256 num_write_outstanding=4 max_widen_bitwidth=512
+    #pragma HLS interface m_axi port=in offset=slave bundle=gmem0 max_read_burst_length=256 num_read_outstanding=4 max_widen_bitwidth=1024
+    #pragma HLS interface m_axi port=out offset=slave bundle=gmem1 max_write_burst_length=256 num_write_outstanding=4 max_widen_bitwidth=1024
     #pragma HLS interface s_axilite port=return
 
-    hls::stream<uint512_dt> stream_s0_to_k1("stream_s0_to_k1");
+    // New decoupled AXI streams
+    hls::stream<uint1024_dt> stream_raw("stream_raw");
+    #pragma HLS STREAM variable=stream_raw depth=8
+
+    hls::stream<uint1024_dt> stream_final("stream_final");
+    #pragma HLS STREAM variable=stream_final depth=8
+
+    hls::stream<uint1024_dt> stream_s0_to_k1("stream_s0_to_k1");
     #pragma HLS STREAM variable=stream_s0_to_k1 depth=16
 
-    hls::stream<uint512_dt> stream_s0_to_k2("stream_s0_to_k2");
+    hls::stream<uint1024_dt> stream_s0_to_k2("stream_s0_to_k2");
     #pragma HLS STREAM variable=stream_s0_to_k2 depth=16
 
-    // Depth stays at 256. It's plenty big enough to hold the ~30 cycle latency
-    // from the division hardware, ensuring K1 never stalls.
-    hls::stream<uint512_dt> stream_s1("stream_s1");
-    #pragma HLS STREAM variable=stream_s1 depth=256
+    // The Deadlock Eliminator: Buffer sized for the entire image block load to absorb divider latency
+    hls::stream<uint1024_dt> stream_s1("stream_s1");
+    #pragma HLS STREAM variable=stream_s1 depth=4096
 
     hls::stream<stat_t> stream_stat("stream_stat");
     #pragma HLS STREAM variable=stream_stat depth=16
 
-    hls::stream<uint512_dt> stream_s3("stream_s3");
+    hls::stream<stat_t> stream_inv_stat("stream_inv_stat");
+    #pragma HLS STREAM variable=stream_inv_stat depth=16
+
+    hls::stream<uint1024_dt> stream_s3("stream_s3");
     #pragma HLS STREAM variable=stream_s3 depth=16
 
     #pragma HLS DATAFLOW
 
-    load_and_K0(in, stream_s0_to_k1, stream_s0_to_k2);
+    read_in(in, stream_raw);
+    K0_preprocess(stream_raw, stream_s0_to_k1, stream_s0_to_k2);
     K1_transform(stream_s0_to_k1, stream_s1);
     K2_statistics(stream_s0_to_k2, stream_stat);
-    K3_normalize(stream_s1, stream_stat, stream_s3);
-    K4_and_store(stream_s3, out);
+    
+    // Separated Divider
+    K3A_divide(stream_stat, stream_inv_stat);
+    K3B_normalize(stream_s1, stream_inv_stat, stream_s3);
+    
+    K4_postprocess(stream_s3, stream_final);
+    write_out(stream_final, out);
 }
