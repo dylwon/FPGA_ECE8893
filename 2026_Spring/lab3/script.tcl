@@ -9,11 +9,15 @@ add_files top.cpp
 # add testbench
 add_files -tb host.cpp
 
+# stop automatic unrolling and pipelining by Vitis so baseline design fits on FPGA
+config_unroll -tripcount_threshold 0
+config_compile -pipeline_loops 0
 
 # FPGA part and clock configuration
-# default frequency is 100 MHz
 set_part {xczu3eg-sbva484-1-e}
-#create_clock -period 4 -name default
+
+# Changed default clock period to 5ns for better performance
+create_clock -period 5.0 -name default
 
 # C synthesis for HLS design, generating RTL
 csynth_design
@@ -25,7 +29,7 @@ cosim_design
 # Note: -flow syn performs RTL synthesis; 
 # -flow impl performs both RTL synthesis and implementation, including a detailed place and route of the RTL netlist.
 # implementation flow will take much longer time
-#export_design -format ip_catalog -flow impl
-export_design -format ip_catalog
+export_design -format ip_catalog -flow impl
+#export_design -format ip_catalog
 
 exit
