@@ -6,7 +6,6 @@
 #define VEC_N (N / TILE_FACTOR)
 #define VEC_BLOCK (BLOCK / TILE_FACTOR)
 
-// The new Dual-Fetch data type
 typedef ap_uint<1024> uint1024_dt;
 
 static inline data_t abs_fp(data_t x) {
@@ -21,9 +20,6 @@ static inline data_t clamp_fp(data_t x, data_t lo, data_t hi) {
     return x;
 }
 
-// --------------------------------------------------------
-// 1. PURE AXI READ (Decoupled from Math)
-// --------------------------------------------------------
 void read_in(const data_t in[N], hls::stream<uint1024_dt>& raw_stream) {
     #pragma HLS INLINE off
     const uint1024_dt* in_ptr = (const uint1024_dt*)in;
@@ -34,9 +30,6 @@ void read_in(const data_t in[N], hls::stream<uint1024_dt>& raw_stream) {
     }
 }
 
-// --------------------------------------------------------
-// 2. K0: Preprocess and Split Streams (Pipelined Math)
-// --------------------------------------------------------
 void K0_preprocess(hls::stream<uint1024_dt>& raw_stream, hls::stream<uint1024_dt>& out_k1, hls::stream<uint1024_dt>& out_k2) {
     #pragma HLS INLINE off
     const coef_t alpha = (coef_t)0.875;
@@ -67,9 +60,6 @@ void K0_preprocess(hls::stream<uint1024_dt>& raw_stream, hls::stream<uint1024_dt
     }
 }
 
-// --------------------------------------------------------
-// K1: Transform Branchless Sliding Window (Bit-Shift Optimized)
-// --------------------------------------------------------
 void K1_transform(hls::stream<uint1024_dt>& in_stream, hls::stream<uint1024_dt>& out_stream) {
     #pragma HLS INLINE off
     const coef_t w0 = (coef_t)0.50;
@@ -107,7 +97,6 @@ void K1_transform(hls::stream<uint1024_dt>& in_stream, hls::stream<uint1024_dt>&
             data_t x1 = window[k + 1];
             data_t x2 = window[k];
 
-            // 1. Let the compiler infer 0-delay bit-shifts for powers of 2!
             acc_t m0 = (acc_t)w0 * (acc_t)x0;
             acc_t m1 = (acc_t)w1 * (acc_t)x1;
             acc_t m2 = (acc_t)w2 * (acc_t)x2;
@@ -118,7 +107,7 @@ void K1_transform(hls::stream<uint1024_dt>& in_stream, hls::stream<uint1024_dt>&
             acc_t acc  = sum1 + m2;
             #pragma HLS BIND_OP variable=acc op=add impl=fabric latency=1
             
-            // Force a hard 2-cycle routing break before the heavy clamp logic
+            // Forces 2-cycles before the clamp to save slack in the critical path
             data_t y;
             {
                 #pragma HLS LATENCY min=2 max=2
@@ -131,9 +120,6 @@ void K1_transform(hls::stream<uint1024_dt>& in_stream, hls::stream<uint1024_dt>&
     }
 }
 
-// --------------------------------------------------------
-// K2: Per-Block Statistic (Clean C++ with Pipelined Tree)
-// --------------------------------------------------------
 void K2_statistics(hls::stream<uint1024_dt>& in_stream, hls::stream<stat_t>& stat_stream) {
     #pragma HLS INLINE off
     const stat_t eps = (stat_t)0.5;
@@ -153,7 +139,7 @@ void K2_statistics(hls::stream<uint1024_dt>& in_stream, hls::stream<stat_t>& sta
             local_sum += (acc_t)abs_fp(val);
         }
         
-        // Force 4 pipeline registers inside the 32-input tree!
+        // Forces 4 pipeline registers inside the 32-input tree
         #pragma HLS BIND_OP variable=local_sum op=add impl=fabric latency=4
         
         sum_abs += local_sum;
@@ -166,9 +152,6 @@ void K2_statistics(hls::stream<uint1024_dt>& in_stream, hls::stream<stat_t>& sta
     }
 }
 
-// --------------------------------------------------------
-// 5. K3A: Isolated Hardware Divider
-// --------------------------------------------------------
 void K3A_divide(hls::stream<stat_t>& stat_stream, hls::stream<stat_t>& inv_stat_stream) {
     #pragma HLS INLINE off
     
@@ -177,16 +160,12 @@ void K3A_divide(hls::stream<stat_t>& stat_stream, hls::stream<stat_t>& inv_stat_
         
         stat_t st = stat_stream.read();
         
-        // Let Vitis HLS auto-infer the best pipelined architecture for this division
         stat_t inv_st = (stat_t)((acc_t)1 / (acc_t)st);
         
         inv_stat_stream.write(inv_st);
     }
 }
 
-// --------------------------------------------------------
-// 6. K3B: Join and Normalize (Pipelined Math)
-// --------------------------------------------------------
 void K3B_normalize(hls::stream<uint1024_dt>& in_stream, hls::stream<stat_t>& inv_stat_stream, hls::stream<uint1024_dt>& out_stream) {
     #pragma HLS INLINE off
     stat_t inv_st = 0;
@@ -217,9 +196,6 @@ void K3B_normalize(hls::stream<uint1024_dt>& in_stream, hls::stream<stat_t>& inv
     }
 }
 
-// --------------------------------------------------------
-// 7. K4: Postprocess (Pipelined Math)
-// --------------------------------------------------------
 void K4_postprocess(hls::stream<uint1024_dt>& in_stream, hls::stream<uint1024_dt>& out_stream) {
     #pragma HLS INLINE off
     const coef_t gamma = (coef_t)1.25;
@@ -250,9 +226,6 @@ void K4_postprocess(hls::stream<uint1024_dt>& in_stream, hls::stream<uint1024_dt
     }
 }
 
-// --------------------------------------------------------
-// 8. PURE AXI WRITE (Decoupled from Math)
-// --------------------------------------------------------
 void write_out(hls::stream<uint1024_dt>& final_stream, data_t out[N]) {
     #pragma HLS INLINE off
     uint1024_dt* out_ptr = (uint1024_dt*)out;
@@ -263,15 +236,11 @@ void write_out(hls::stream<uint1024_dt>& final_stream, data_t out[N]) {
     }
 }
 
-// --------------------------------------------------------
-// TOP KERNEL
-// --------------------------------------------------------
 void top_kernel(const data_t in[N], data_t out[N]) {
     #pragma HLS interface m_axi port=in offset=slave bundle=gmem0 max_read_burst_length=256 num_read_outstanding=4 max_widen_bitwidth=1024
     #pragma HLS interface m_axi port=out offset=slave bundle=gmem1 max_write_burst_length=256 num_write_outstanding=4 max_widen_bitwidth=1024
     #pragma HLS interface s_axilite port=return
 
-    // New decoupled AXI streams
     hls::stream<uint1024_dt> stream_raw("stream_raw");
     #pragma HLS STREAM variable=stream_raw depth=8
 
@@ -305,7 +274,6 @@ void top_kernel(const data_t in[N], data_t out[N]) {
     K1_transform(stream_s0_to_k1, stream_s1);
     K2_statistics(stream_s0_to_k2, stream_stat);
     
-    // Separated Divider
     K3A_divide(stream_stat, stream_inv_stat);
     K3B_normalize(stream_s1, stream_inv_stat, stream_s3);
     
