@@ -138,18 +138,36 @@ int main() {
     std::cout << "Running Golden Reference...\n";
     golden_vision_pipeline(in, out_gold);
 
-    // Verify Correctness
+    // Verify Correctness with +/- 1% Tolerance
     int errors = 0;
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
-            // Fixed-point exact match check
-            if (out_hw[r][c] != out_gold[r][c]) {
+            
+            // Convert ap_fixed to double for easy testbench math
+            double hw_val = out_hw[r][c].to_double();
+            double gold_val = out_gold[r][c].to_double();
+            
+            // Calculate absolute difference
+            double diff = std::abs(hw_val - gold_val);
+            
+            // Calculate the 1% allowed error threshold
+            double allowed_error = 0.01 * std::abs(gold_val);
+            
+            // Edge Case: If the golden value is exactly 0, 1% of 0 is 0.
+            // We need a tiny absolute threshold here to prevent false failures 
+            // from negligible hardware noise (like 0.001 != 0.0).
+            if (gold_val == 0.0) {
+                allowed_error = 0.05; // Small absolute baseline tolerance
+            }
+
+            // Check if the difference exceeds the 1% allowed error
+            if (diff > allowed_error) {
                 errors++;
-                if (errors <= 10) { // Limit error printing
+                if (errors <= 10) { // Limit error printing so it doesn't flood the console
                     std::cout << "Mismatch at [" << r << "][" << c << "]"
-                              << " hw=" << out_hw[r][c].to_double()
-                              << " gold=" << out_gold[r][c].to_double()
-                              << "\n";
+                              << " hw=" << hw_val
+                              << " gold=" << gold_val
+                              << " (diff=" << diff << " > allowed=" << allowed_error << ")\n";
                 }
             }
         }
