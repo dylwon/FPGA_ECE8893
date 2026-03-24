@@ -148,7 +148,7 @@ void kernel5_double_threshold(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEI
 // ---------------------------------------------------------
 // Top-Level Function
 // ---------------------------------------------------------
-void top_vision_pipeline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
+void top_kernel(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     // 1. DATAFLOW Directive: Overlaps the execution of all 5 kernels.
     #pragma HLS DATAFLOW
 
