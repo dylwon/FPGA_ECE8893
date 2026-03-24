@@ -113,21 +113,58 @@ void kernel4_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stag
 }
 
 // ---------------------------------------------------------
-// Kernel 5: Double Thresholding
+// Kernel 5: Double Thresholding & Edge Tracking (Hysteresis)
+// Categorizes pixels and connects weak edges to strong edges.
 // ---------------------------------------------------------
-void kernel5_double_threshold(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
+void kernel5_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     pixel_t HIGH_THRESH = 50;
     pixel_t LOW_THRESH = 20;
 
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
-            pixel_t val = stage4[r][c];
-            if (val >= HIGH_THRESH) {
-                img_out[r][c] = 255; 
-            } else if (val >= LOW_THRESH) {
-                img_out[r][c] = 127; 
-            } else {
-                img_out[r][c] = 0;   
+            
+            // Boundary pixels are set to zero to avoid out-of-bounds memory access
+            if (r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1) {
+                img_out[r][c] = 0;
+                continue;
+            }
+
+            pixel_t center_pixel = stage4[r][c];
+            
+            // Step 1: Is it a definitively strong edge?
+            if (center_pixel >= HIGH_THRESH) {
+                img_out[r][c] = 255;
+            } 
+            // Step 2: Is it definitively NOT an edge?
+            else if (center_pixel < LOW_THRESH) {
+                img_out[r][c] = 0;
+            } 
+            // Step 3: It is a weak edge. Perform 8-way neighborhood Hysteresis.
+            else {
+                bool connected_to_strong = false;
+                
+                // Check the 3x3 neighborhood around the weak pixel
+                for (int kr = -1; kr <= 1; kr++) {
+                    for (int kc = -1; kc <= 1; kc++) {
+                        
+                        // Skip checking the center pixel against itself
+                        if (kr == 0 && kc == 0) continue; 
+                        
+                        pixel_t neighbor = stage4[r + kr][c + kc];
+                        
+                        // If any neighbor is a strong edge, flag it
+                        if (neighbor >= HIGH_THRESH) {
+                            connected_to_strong = true;
+                        }
+                    }
+                }
+                
+                // Promote to strong edge if connected, otherwise suppress to zero
+                if (connected_to_strong) {
+                    img_out[r][c] = 255;
+                } else {
+                    img_out[r][c] = 0;
+                }
             }
         }
     }
@@ -148,5 +185,5 @@ void top_kernel(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     kernel2_sobel_gradients(stage1, stage2_x, stage2_y);
     kernel3_magnitude_direction(stage2_x, stage2_y, stage3_mag, stage3_dir);
     kernel4_non_max_suppression(stage3_mag, stage3_dir, stage4);
-    kernel5_double_threshold(stage4, img_out);
+    kernel5_hysteresis(stage4, img_out);
 }
