@@ -132,7 +132,7 @@ int main() {
 
     // Run Device Under Test (Your HLS code)
     std::cout << "Running Hardware Design...\n";
-    top_vision_pipeline(in, out_hw);
+    top_kernel(in, out_hw);
 
     // Run Golden Model
     std::cout << "Running Golden Reference...\n";
