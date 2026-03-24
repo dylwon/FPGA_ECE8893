@@ -9,8 +9,16 @@ CFLAG += -fPIC -O0
 CFLAG += -lm
 CFLAG += -std=c++11 -Wno-unused-result 
 
-all:
-	g++ *.cpp -o result $(CFLAG) $(IFLAG)
-	
+# Default make command
+all: baseline optimized
+
+# Make Baseline Design
+baseline:
+	g++ unopt-top.cpp host.cpp -o result $(CFLAG) $(IFLAG)
+
+# Make Optimized Design
+optimized:
+	g++ top.cpp host.cpp -o result $(CFLAG) $(IFLAG)
+    
 clean:
 	rm -f *.o result
