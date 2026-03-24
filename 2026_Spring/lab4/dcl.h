@@ -13,6 +13,6 @@ typedef ap_fixed<32, 16, AP_TRN, AP_WRAP> calc_t;
 typedef ap_fixed<16, 2, AP_TRN, AP_WRAP> coef_t;
 
 // Prototype for your hardware design
-void top_vision_pipeline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]);
+void top_kernel(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]);
 
 #endif
