@@ -31,7 +31,6 @@ static void golden_kernel1(pixel_t img_in[HEIGHT][WIDTH], pixel_t stage1[HEIGHT]
 
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
-            // Match the baseline's 3-pixel boundary safety
             if (r < 3 || r >= HEIGHT - 3 || c < 3 || c >= WIDTH - 3) {
                 stage1[r][c] = img_in[r][c];
             } else {
@@ -69,15 +68,37 @@ static void golden_kernel2(pixel_t stage1[HEIGHT][WIDTH], pixel_t stage2_x[HEIGH
     }
 }
 
+// ---------------------------------------------------------
+// Golden Kernel 3: Magnitude & True Gradient Direction
+// ---------------------------------------------------------
 static void golden_kernel3(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2_y[HEIGHT][WIDTH], pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             calc_t gx = stage2_x[r][c];
             calc_t gy = stage2_y[r][c];
+            
             calc_t abs_gx = (gx < 0) ? (calc_t)(-gx) : gx;
             calc_t abs_gy = (gy < 0) ? (calc_t)(-gy) : gy;
             stage3_mag[r][c] = (pixel_t)(abs_gx + abs_gy);
-            stage3_dir[r][c] = (abs_gx > abs_gy) ? (pixel_t)0 : (pixel_t)90;
+
+            pixel_t dir = 0;
+            if (gx == 0) {
+                dir = 90; 
+            } else {
+                // The mathematical anchor for the hardware divider
+                calc_t slope = gy / gx; 
+
+                if (slope > (calc_t)-0.414 && slope <= (calc_t)0.414) {
+                    dir = 0;
+                } else if (slope > (calc_t)0.414 && slope <= (calc_t)2.414) {
+                    dir = 45;
+                } else if (slope < (calc_t)-0.414 && slope >= (calc_t)-2.414) {
+                    dir = 135;
+                } else {
+                    dir = 90;
+                }
+            }
+            stage3_dir[r][c] = dir;
         }
     }
 }
@@ -99,34 +120,31 @@ static void golden_kernel4(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir
 }
 
 // ---------------------------------------------------------
-// Golden Kernel 5: Adaptive Local Thresholding & Hysteresis
+// Golden Kernel 5: Adaptive Thresholding & Hysteresis
 // ---------------------------------------------------------
 static void golden_kernel5(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
-            // Match the baseline's 2-pixel boundary safety for the 5x5 window
             if (r < 2 || r >= HEIGHT - 2 || c < 2 || c >= WIDTH - 2) {
                 img_out[r][c] = 0;
                 continue;
             }
 
-            // Step 1: 5x5 Local Mean
             calc_t local_sum = 0;
             for (int kr = -2; kr <= 2; kr++) {
                 for (int kc = -2; kc <= 2; kc++) {
                     local_sum += stage4[r + kr][c + kc];
                 }
             }
-            pixel_t local_mean = (pixel_t)(local_sum * (calc_t)0.04); 
+            
+            pixel_t local_mean = (pixel_t)(local_sum / (calc_t)25); 
 
-            // Step 2: Dynamic Thresholds
             pixel_t HIGH_THRESH = local_mean + (pixel_t)15;
             pixel_t LOW_THRESH  = local_mean - (pixel_t)5;
             
             pixel_t center_pixel = stage4[r][c];
             
-            // Step 3: Hysteresis
             if (center_pixel >= HIGH_THRESH) {
                 img_out[r][c] = 255;
             } else if (center_pixel < LOW_THRESH) {
@@ -136,8 +154,6 @@ static void golden_kernel5(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT
                 for (int kr = -1; kr <= 1; kr++) {
                     for (int kc = -1; kc <= 1; kc++) {
                         if (kr == 0 && kc == 0) continue; 
-                        
-                        // Exact match: checking neighbors against the dynamic high threshold
                         if (stage4[r + kr][c + kc] >= HIGH_THRESH) {
                             connected = true;
                         }
