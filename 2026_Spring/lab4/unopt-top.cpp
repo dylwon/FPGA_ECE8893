@@ -1,24 +1,34 @@
 #include "dcl.h"
 
 // ---------------------------------------------------------
-// Kernel 1: Gaussian Blur (Noise Reduction)
+// Kernel 1: 7x7 Gaussian Blur (High-Fidelity Noise Reduction)
+// Massively increases baseline cycle count via 49 MACs per pixel.
 // ---------------------------------------------------------
 void kernel1_gaussian_blur(pixel_t img_in[HEIGHT][WIDTH], pixel_t stage1[HEIGHT][WIDTH]) {
-    coef_t kernel[3][3] = {
-        {0.0625, 0.125, 0.0625},
-        {0.125,  0.25,  0.125},
-        {0.0625, 0.125, 0.0625}
+    // 7x7 Gaussian Kernel Approximation (Sum = ~1.0)
+    coef_t kernel[7][7] = {
+        {0.0000, 0.0002, 0.0011, 0.0018, 0.0011, 0.0002, 0.0000},
+        {0.0002, 0.0029, 0.0130, 0.0215, 0.0130, 0.0029, 0.0002},
+        {0.0011, 0.0130, 0.0585, 0.0965, 0.0585, 0.0130, 0.0011},
+        {0.0018, 0.0215, 0.0965, 0.1591, 0.0965, 0.0215, 0.0018},
+        {0.0011, 0.0130, 0.0585, 0.0965, 0.0585, 0.0130, 0.0011},
+        {0.0002, 0.0029, 0.0130, 0.0215, 0.0130, 0.0029, 0.0002},
+        {0.0000, 0.0002, 0.0011, 0.0018, 0.0011, 0.0002, 0.0000}
     };
 
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
-            if (r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1) {
+            
+            // Boundary safety margin is now 3 pixels for a 7x7 window
+            if (r < 3 || r >= HEIGHT - 3 || c < 3 || c >= WIDTH - 3) {
                 stage1[r][c] = img_in[r][c];
             } else {
                 calc_t sum = 0;
-                for (int kr = -1; kr <= 1; kr++) {
-                    for (int kc = -1; kc <= 1; kc++) {
-                        sum += img_in[r + kr][c + kc] * kernel[kr + 1][kc + 1];
+                
+                // Deeply nested 7x7 loop (The CPU Bottleneck)
+                for (int kr = -3; kr <= 3; kr++) {
+                    for (int kc = -3; kc <= 3; kc++) {
+                        sum += img_in[r + kr][c + kc] * kernel[kr + 3][kc + 3];
                     }
                 }
                 stage1[r][c] = (pixel_t)sum;
@@ -113,58 +123,54 @@ void kernel4_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stag
 }
 
 // ---------------------------------------------------------
-// Kernel 5: Double Thresholding & Edge Tracking (Hysteresis)
-// Categorizes pixels and connects weak edges to strong edges.
+// Kernel 5: Adaptive Thresholding & Edge Tracking (Hysteresis)
+// Introduces a 5x5 local mean calculation before hysteresis.
 // ---------------------------------------------------------
 void kernel5_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
-    pixel_t HIGH_THRESH = 50;
-    pixel_t LOW_THRESH = 20;
-
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
-            // Boundary pixels are set to zero to avoid out-of-bounds memory access
-            if (r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1) {
+            // Boundary safety margin is 2 pixels for a 5x5 window
+            if (r < 2 || r >= HEIGHT - 2 || c < 2 || c >= WIDTH - 2) {
                 img_out[r][c] = 0;
                 continue;
             }
 
+            // --- Step 1: Calculate 5x5 Local Mean ---
+            calc_t local_sum = 0;
+            for (int kr = -2; kr <= 2; kr++) {
+                for (int kc = -2; kc <= 2; kc++) {
+                    local_sum += stage4[r + kr][c + kc];
+                }
+            }
+            // Divide by 25 (Multiply by 0.04 to avoid a heavy hardware divider)
+            pixel_t local_mean = (pixel_t)(local_sum * (calc_t)0.04); 
+
+            // --- Step 2: Set Dynamic Thresholds ---
+            pixel_t HIGH_THRESH = local_mean + (pixel_t)15;
+            pixel_t LOW_THRESH  = local_mean - (pixel_t)5;
+            
             pixel_t center_pixel = stage4[r][c];
             
-            // Step 1: Is it a definitively strong edge?
+            // --- Step 3: Hysteresis Logic ---
             if (center_pixel >= HIGH_THRESH) {
                 img_out[r][c] = 255;
-            } 
-            // Step 2: Is it definitively NOT an edge?
-            else if (center_pixel < LOW_THRESH) {
+            } else if (center_pixel < LOW_THRESH) {
                 img_out[r][c] = 0;
-            } 
-            // Step 3: It is a weak edge. Perform 8-way neighborhood Hysteresis.
-            else {
-                bool connected_to_strong = false;
-                
-                // Check the 3x3 neighborhood around the weak pixel
+            } else {
+                bool connected = false;
+                // Standard 3x3 check for connected strong edges
                 for (int kr = -1; kr <= 1; kr++) {
                     for (int kc = -1; kc <= 1; kc++) {
-                        
-                        // Skip checking the center pixel against itself
                         if (kr == 0 && kc == 0) continue; 
                         
-                        pixel_t neighbor = stage4[r + kr][c + kc];
-                        
-                        // If any neighbor is a strong edge, flag it
-                        if (neighbor >= HIGH_THRESH) {
-                            connected_to_strong = true;
+                        // It must be connected to a pixel that is ALSO above the new dynamic high threshold
+                        if (stage4[r + kr][c + kc] >= HIGH_THRESH) {
+                            connected = true;
                         }
                     }
                 }
-                
-                // Promote to strong edge if connected, otherwise suppress to zero
-                if (connected_to_strong) {
-                    img_out[r][c] = 255;
-                } else {
-                    img_out[r][c] = 0;
-                }
+                img_out[r][c] = connected ? (pixel_t)255 : (pixel_t)0;
             }
         }
     }
