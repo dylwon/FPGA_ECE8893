@@ -3,9 +3,8 @@
 
 #include <ap_fixed.h>
 
-// Image dimensions (Can scale down to 128x128 for faster C-simulation during testing)
-#define HEIGHT 512
-#define WIDTH 512
+#define HEIGHT 256
+#define WIDTH 256
 
 // Fixed-point data types satisfying the rubric requirement
 typedef ap_fixed<16, 8, AP_TRN, AP_WRAP> pixel_t;
