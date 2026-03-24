@@ -67,7 +67,8 @@ void kernel2_sobel_gradients(pixel_t stage1[HEIGHT][WIDTH], pixel_t stage2_x[HEI
 }
 
 // ---------------------------------------------------------
-// Kernel 3: Gradient Magnitude & Approximate Direction
+// Kernel 3: Magnitude & True Gradient Direction
+// Introduces a heavy fixed-point division for every pixel
 // ---------------------------------------------------------
 void kernel3_magnitude_direction(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2_y[HEIGHT][WIDTH], pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
@@ -75,15 +76,30 @@ void kernel3_magnitude_direction(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2
             calc_t gx = stage2_x[r][c];
             calc_t gy = stage2_y[r][c];
             
+            // Keep the L1 norm for magnitude
             calc_t abs_gx = (gx < 0) ? (calc_t)(-gx) : gx;
             calc_t abs_gy = (gy < 0) ? (calc_t)(-gy) : gy;
             stage3_mag[r][c] = (pixel_t)(abs_gx + abs_gy);
 
+            // --- THE BOTTLENECK: True Slope Division ---
             pixel_t dir = 0;
-            if (abs_gx > abs_gy) {
-                dir = 0; 
-            } else {
+            if (gx == 0) {
+                // Avoid divide-by-zero
                 dir = 90; 
+            } else {
+                // Massive hardware stall here
+                calc_t slope = gy / gx; 
+
+                // Categorize into 0, 45, 90, 135 degrees using tangent approximations
+                if (slope > (calc_t)-0.414 && slope <= (calc_t)0.414) {
+                    dir = 0;
+                } else if (slope > (calc_t)0.414 && slope <= (calc_t)2.414) {
+                    dir = 45;
+                } else if (slope < (calc_t)-0.414 && slope >= (calc_t)-2.414) {
+                    dir = 135;
+                } else {
+                    dir = 90;
+                }
             }
             stage3_dir[r][c] = dir;
         }
@@ -143,8 +159,8 @@ void kernel5_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][W
                     local_sum += stage4[r + kr][c + kc];
                 }
             }
-            // Divide by 25 (Multiply by 0.04 to avoid a heavy hardware divider)
-            pixel_t local_mean = (pixel_t)(local_sum * (calc_t)0.04); 
+
+            pixel_t local_mean = (pixel_t)(local_sum / (calc_t)25);
 
             // --- Step 2: Set Dynamic Thresholds ---
             pixel_t HIGH_THRESH = local_mean + (pixel_t)15;
