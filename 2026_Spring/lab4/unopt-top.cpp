@@ -1,6 +1,41 @@
 #include "dcl.h"
 
 // ---------------------------------------------------------
+// Kernel 0: Full YCbCr Color Space Converter (Baseline)
+// ---------------------------------------------------------
+void kernel0_rgb_to_ycbcr(
+    pixel_t img_r[HEIGHT][WIDTH], 
+    pixel_t img_g[HEIGHT][WIDTH], 
+    pixel_t img_b[HEIGHT][WIDTH], 
+    pixel_t img_gray[HEIGHT][WIDTH]
+) {
+    for (int r = 0; r < HEIGHT; r++) {
+        for (int c = 0; c < WIDTH; c++) {
+            
+            int red = (int)img_r[r][c];
+            int green = (int)img_g[r][c];
+            int blue = (int)img_b[r][c];
+
+            // Step 1: ITU-R BT.601 Matrix Multiplication (Bit-shifted by 8)
+            int y_calc = (66 * red + 129 * green + 25 * blue + 4096) >> 8;
+
+            // Step 2: Broadcast Legal Saturation
+            if (y_calc < 16) y_calc = 16;
+            else if (y_calc > 235) y_calc = 235;
+
+            // Step 3: Dynamic Range Normalization (Stretch 16-235 to 0-255)
+            int normalized_gray = ((y_calc - 16) * 298) >> 8;
+
+            // Final safety clamp
+            if (normalized_gray < 0) normalized_gray = 0;
+            else if (normalized_gray > 255) normalized_gray = 255;
+
+            img_gray[r][c] = (pixel_t)normalized_gray;
+        }
+    }
+}
+
+// ---------------------------------------------------------
 // Kernel 1: 7x7 Gaussian Blur (High-Fidelity Noise Reduction)
 // Massively increases baseline cycle count via 49 MACs per pixel.
 // ---------------------------------------------------------
@@ -107,11 +142,13 @@ void kernel3_magnitude_direction(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2
 }
 
 // ---------------------------------------------------------
-// Kernel 4: Non-Maximum Suppression (Thinning)
+// Kernel 4: Non-Maximum Suppression (Corrected Baseline)
 // ---------------------------------------------------------
 void kernel4_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir[HEIGHT][WIDTH], pixel_t stage4[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
+            
+            // Boundary safety check
             if (r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1) {
                 stage4[r][c] = 0;
                 continue;
@@ -122,13 +159,24 @@ void kernel4_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stag
             pixel_t mag1 = 0, mag2 = 0;
 
             if (dir == 0) { 
+                // Horizontal edge: check left and right
                 mag1 = stage3_mag[r][c - 1];
                 mag2 = stage3_mag[r][c + 1];
-            } else { 
+            } else if (dir == 90) { 
+                // Vertical edge: check top and bottom
                 mag1 = stage3_mag[r - 1][c];
                 mag2 = stage3_mag[r + 1][c];
+            } else if (dir == 45) { 
+                // Diagonal 45: check bottom-left and top-right
+                mag1 = stage3_mag[r + 1][c - 1];
+                mag2 = stage3_mag[r - 1][c + 1];
+            } else { 
+                // Diagonal 135: check top-left and bottom-right
+                mag1 = stage3_mag[r - 1][c - 1];
+                mag2 = stage3_mag[r + 1][c + 1];
             }
 
+            // Suppress non-maximum pixels
             if (mag >= mag1 && mag >= mag2) {
                 stage4[r][c] = mag;
             } else {
@@ -193,19 +241,53 @@ void kernel5_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][W
 }
 
 // ---------------------------------------------------------
+// Kernel 6: Morphological Dilation (Unoptimized Baseline)
+// ---------------------------------------------------------
+void kernel6_dilation(pixel_t stage5[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
+    for (int r = 0; r < HEIGHT; r++) {
+        for (int c = 0; c < WIDTH; c++) {
+            
+            // Boundary safety margin: 1 pixel for a 3x3 window
+            if (r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1) {
+                img_out[r][c] = 0;
+                continue;
+            }
+
+            // Dilation logic: 3x3 neighborhood search
+            pixel_t max_val = 0;
+            for (int kr = -1; kr <= 1; kr++) {
+                for (int kc = -1; kc <= 1; kc++) {
+                    // If any neighbor is a strong edge (255), the center becomes an edge
+                    if (stage5[r + kr][c + kc] == 255) {
+                        max_val = 255;
+                    }
+                }
+            }
+            
+            img_out[r][c] = max_val;
+        }
+    }
+}
+
+// ---------------------------------------------------------
 // Top-Level Function
 // ---------------------------------------------------------
-void top_kernel(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
-    static pixel_t stage1[HEIGHT][WIDTH];
-    static pixel_t stage2_x[HEIGHT][WIDTH];
-    static pixel_t stage2_y[HEIGHT][WIDTH];
-    static pixel_t stage3_mag[HEIGHT][WIDTH];
-    static pixel_t stage3_dir[HEIGHT][WIDTH];
-    static pixel_t stage4[HEIGHT][WIDTH];
+void top_kernel(
+    pixel_t img_r[HEIGHT][WIDTH], 
+    pixel_t img_g[HEIGHT][WIDTH], 
+    pixel_t img_b[HEIGHT][WIDTH], 
+    pixel_t img_out[HEIGHT][WIDTH]
+) {
+    static pixel_t buf_A[HEIGHT][WIDTH]; 
+    static pixel_t buf_B[HEIGHT][WIDTH]; 
+    static pixel_t buf_C[HEIGHT][WIDTH]; 
+    static pixel_t buf_D[HEIGHT][WIDTH]; 
 
-    kernel1_gaussian_blur(img_in, stage1);
-    kernel2_sobel_gradients(stage1, stage2_x, stage2_y);
-    kernel3_magnitude_direction(stage2_x, stage2_y, stage3_mag, stage3_dir);
-    kernel4_non_max_suppression(stage3_mag, stage3_dir, stage4);
-    kernel5_hysteresis(stage4, img_out);
+    kernel0_rgb_to_ycbcr(img_r, img_g, img_b, buf_A); 
+    kernel1_gaussian_blur(buf_A, buf_B);         
+    kernel2_sobel_gradients(buf_B, buf_A, buf_C);
+    kernel3_magnitude_direction(buf_A, buf_C, buf_B, buf_D);
+    kernel4_non_max_suppression(buf_B, buf_D, buf_A);
+    kernel5_hysteresis(buf_A, buf_B); 
+    kernel6_dilation(buf_B, img_out); 
 }
