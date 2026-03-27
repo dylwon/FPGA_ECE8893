@@ -2,13 +2,22 @@
 #include <hls_stream.h>
 
 // ---------------------------------------------------------
-// Helper: Array to Stream / Stream to Array
+// Helper: RGB Arrays to Streams
 // ---------------------------------------------------------
-void read_input(pixel_t img_in[HEIGHT][WIDTH], hls::stream<pixel_t>& stream_out) {
+void read_input_rgb(
+    pixel_t img_r[HEIGHT][WIDTH], 
+    pixel_t img_g[HEIGHT][WIDTH], 
+    pixel_t img_b[HEIGHT][WIDTH], 
+    hls::stream<pixel_t>& stream_r,
+    hls::stream<pixel_t>& stream_g,
+    hls::stream<pixel_t>& stream_b
+) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             #pragma HLS PIPELINE II=1
-            stream_out.write(img_in[r][c]);
+            stream_r.write(img_r[r][c]);
+            stream_g.write(img_g[r][c]);
+            stream_b.write(img_b[r][c]);
         }
     }
 }
@@ -19,6 +28,40 @@ void write_output(hls::stream<pixel_t>& stream_in, pixel_t img_out[HEIGHT][WIDTH
             #pragma HLS PIPELINE II=1
             img_out[r][c] = stream_in.read();
         }
+    }
+}
+
+
+// ---------------------------------------------------------
+// Kernel 0: Full YCbCr Color Space Converter
+// ---------------------------------------------------------
+void kernel0_rgb_to_ycbcr_opt(
+    hls::stream<pixel_t>& stream_r, 
+    hls::stream<pixel_t>& stream_g, 
+    hls::stream<pixel_t>& stream_b, 
+    hls::stream<pixel_t>& stream_gray
+) {
+    for (int i = 0; i < HEIGHT * WIDTH; i++) {
+        #pragma HLS PIPELINE II=1
+
+        int red = (int)stream_r.read();
+        int green = (int)stream_g.read();
+        int blue = (int)stream_b.read();
+
+        // Step 1: ITU-R BT.601 Matrix Multiplication
+        int y_calc = (66 * red + 129 * green + 25 * blue + 4096) >> 8;
+
+        // Step 2: Broadcast Legal Saturation
+        if (y_calc < 16) y_calc = 16;
+        else if (y_calc > 235) y_calc = 235;
+
+        // Step 3: Dynamic Range Normalization
+        int normalized_gray = ((y_calc - 16) * 298) >> 8;
+
+        if (normalized_gray < 0) normalized_gray = 0;
+        else if (normalized_gray > 255) normalized_gray = 255;
+
+        stream_gray.write((pixel_t)normalized_gray);
     }
 }
 
@@ -304,41 +347,115 @@ void kernel5_hysteresis_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t
     }
 }
 
+
+// ---------------------------------------------------------
+// Kernel 6: Morphological Dilation (Optimized Stream)
+// Phase Shift: 1 pixel
+// ---------------------------------------------------------
+void kernel6_dilation_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_out) {
+    static pixel_t line_buf[2][WIDTH];
+    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
+    pixel_t window[3][3];
+    #pragma HLS ARRAY_PARTITION variable=window complete dim=0
+
+    // Loop extended by 1 to flush the 3x3 trailing border pixels
+    for (int r = 0; r < HEIGHT + 1; r++) {
+        for (int c = 0; c < WIDTH + 1; c++) {
+            #pragma HLS PIPELINE II=1
+
+            pixel_t new_pix = 0;
+            if (r < HEIGHT && c < WIDTH) new_pix = stream_in.read();
+
+            // 1. Shift Window Left
+            for (int i = 0; i < 3; i++) {
+                window[i][0] = window[i][1]; window[i][1] = window[i][2];
+            }
+
+            // 2. Load Column from BRAM Line Buffers
+            pixel_t col[2];
+            #pragma HLS ARRAY_PARTITION variable=col complete dim=0
+            int c_idx = (c < WIDTH) ? c : WIDTH - 1;
+            col[0] = line_buf[0][c_idx]; col[1] = line_buf[1][c_idx];
+
+            window[0][2] = col[0]; window[1][2] = col[1]; window[2][2] = new_pix;
+
+            // 3. Update BRAM Line Buffers
+            if (c < WIDTH) {
+                line_buf[0][c] = col[1];
+                line_buf[1][c] = new_pix;
+            }
+
+            // 4. Compute and Write (Phase delayed by 1 pixel)
+            if (r >= 1 && c >= 1) {
+                int out_r = r - 1; 
+                int out_c = c - 1;
+                
+                if (out_r == 0 || out_r == HEIGHT - 1 || out_c == 0 || out_c == WIDTH - 1) {
+                    stream_out.write(0);
+                } else {
+                    // Dilation Hardware Logic: Or-gate equivalent
+                    pixel_t max_val = 0;
+                    for (int kr = 0; kr < 3; kr++) {
+                        for (int kc = 0; kc < 3; kc++) {
+                            if (window[kr][kc] == 255) max_val = 255;
+                        }
+                    }
+                    stream_out.write(max_val);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------
 // Top-Level Function
 // ---------------------------------------------------------
-void top_kernel(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
+void top_kernel(
+    pixel_t img_r[HEIGHT][WIDTH], 
+    pixel_t img_g[HEIGHT][WIDTH], 
+    pixel_t img_b[HEIGHT][WIDTH], 
+    pixel_t img_out[HEIGHT][WIDTH]
+) {
     #pragma HLS DATAFLOW
 
     // Instantiate elastic FIFOs
-    hls::stream<pixel_t> stream_in("in");
+    hls::stream<pixel_t> stream_r("r_in");
+    hls::stream<pixel_t> stream_g("g_in");
+    hls::stream<pixel_t> stream_b("b_in");
+    hls::stream<pixel_t> stream_gray("gray_out"); // Connects K0 to K1
+    
     hls::stream<pixel_t> stream_k1("k1");
     hls::stream<pixel_t> stream_k2x("k2x");
     hls::stream<pixel_t> stream_k2y("k2y");
     hls::stream<pixel_t> stream_k3mag("k3mag");
     hls::stream<pixel_t> stream_k3dir("k3dir");
     hls::stream<pixel_t> stream_k4("k4");
+    hls::stream<pixel_t> stream_k5("k5"); 
     hls::stream<pixel_t> stream_out("out");
 
-    // --- THE FIX: Elastic Buffering ---
-    // Expand depth to 512 to swallow row-blanking phase drifts.
-    // This consumes virtually zero FPGA resources (just a few LUTRAMs) 
-    // but completely eliminates DATAFLOW deadlocks.
-    #pragma HLS STREAM variable=stream_in depth=512
+    // Maintain depth=512 to prevent deadlocks
+    #pragma HLS STREAM variable=stream_r depth=512
+    #pragma HLS STREAM variable=stream_g depth=512
+    #pragma HLS STREAM variable=stream_b depth=512
+    #pragma HLS STREAM variable=stream_gray depth=512
     #pragma HLS STREAM variable=stream_k1 depth=512
     #pragma HLS STREAM variable=stream_k2x depth=512
     #pragma HLS STREAM variable=stream_k2y depth=512
     #pragma HLS STREAM variable=stream_k3mag depth=512
     #pragma HLS STREAM variable=stream_k3dir depth=512
     #pragma HLS STREAM variable=stream_k4 depth=512
+    #pragma HLS STREAM variable=stream_k5 depth=512
     #pragma HLS STREAM variable=stream_out depth=512
 
-    // Wire the hardware blocks together
-    read_input(img_in, stream_in);
-    kernel1_gaussian_blur_opt(stream_in, stream_k1);
+    read_input_rgb(img_r, img_g, img_b, stream_r, stream_g, stream_b);
+    
+    kernel0_rgb_to_ycbcr_opt(stream_r, stream_g, stream_b, stream_gray);
+    kernel1_gaussian_blur_opt(stream_gray, stream_k1);
     kernel2_sobel_opt(stream_k1, stream_k2x, stream_k2y);
     kernel3_mag_dir_opt(stream_k2x, stream_k2y, stream_k3mag, stream_k3dir);
     kernel4_nms_opt(stream_k3mag, stream_k3dir, stream_k4);
-    kernel5_hysteresis_opt(stream_k4, stream_out);
+    kernel5_hysteresis_opt(stream_k4, stream_k5); 
+    kernel6_dilation_opt(stream_k5, stream_out); 
+    
     write_output(stream_out, img_out);
 }
