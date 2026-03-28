@@ -14,7 +14,7 @@ all: baseline optimized
 
 # Make Baseline Design
 baseline:
-	g++ unopt-top.cpp host.cpp -o result $(CFLAG) $(IFLAG)
+	g++ baseline.cpp host.cpp -o result $(CFLAG) $(IFLAG)
 
 # Make Optimized Design
 optimized:
