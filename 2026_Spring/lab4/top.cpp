@@ -33,9 +33,9 @@ void write_output(hls::stream<pixel_t>& stream_in, pixel_t img_out[HEIGHT][WIDTH
 
 
 // ---------------------------------------------------------
-// Kernel 0: Full YCbCr Color Space Converter
+// Kernel 1: Full YCbCr Color Space Converter
 // ---------------------------------------------------------
-void kernel0_rgb_to_ycbcr_opt(
+void kernel1_rgb_to_ycbcr_opt(
     hls::stream<pixel_t>& stream_r, 
     hls::stream<pixel_t>& stream_g, 
     hls::stream<pixel_t>& stream_b, 
@@ -66,64 +66,89 @@ void kernel0_rgb_to_ycbcr_opt(
 }
 
 // ---------------------------------------------------------
-// Kernel 1: 7x7 Gaussian Blur
+// Kernel 2: Median Filter (Optimized Stream)
+// Phase Shift: 2 pixels
 // ---------------------------------------------------------
-void kernel1_gaussian_blur_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_out) {
-    coef_t kernel[7][7] = {
-        {0.0000, 0.0002, 0.0011, 0.0018, 0.0011, 0.0002, 0.0000},
-        {0.0002, 0.0029, 0.0130, 0.0215, 0.0130, 0.0029, 0.0002},
-        {0.0011, 0.0130, 0.0585, 0.0965, 0.0585, 0.0130, 0.0011},
-        {0.0018, 0.0215, 0.0965, 0.1591, 0.0965, 0.0215, 0.0018},
-        {0.0011, 0.0130, 0.0585, 0.0965, 0.0585, 0.0130, 0.0011},
-        {0.0002, 0.0029, 0.0130, 0.0215, 0.0130, 0.0029, 0.0002},
-        {0.0000, 0.0002, 0.0011, 0.0018, 0.0011, 0.0002, 0.0000}
-    };
-    #pragma HLS ARRAY_PARTITION variable=kernel complete dim=0
-
-    static pixel_t line_buf[6][WIDTH];
+void kernel2_median_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_out) {
+    
+    static pixel_t line_buf[4][WIDTH];
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
-    pixel_t window[7][7];
+    
+    pixel_t window[5][5];
     #pragma HLS ARRAY_PARTITION variable=window complete dim=0
 
-    for (int r = 0; r < HEIGHT + 3; r++) {
-        for (int c = 0; c < WIDTH + 3; c++) {
+    // Loop extended by 2 to flush the trailing border pixels
+    for (int r = 0; r < HEIGHT + 2; r++) {
+        for (int c = 0; c < WIDTH + 2; c++) {
             #pragma HLS PIPELINE II=1
 
             pixel_t new_pix = 0;
             if (r < HEIGHT && c < WIDTH) new_pix = stream_in.read();
 
-            // Shift Window
-            for (int i = 0; i < 7; i++) {
-                for (int j = 0; j < 6; j++) window[i][j] = window[i][j + 1];
+            // 1. Shift Window Left
+            for (int i = 0; i < 5; i++) {
+                for (int j = 0; j < 4; j++) {
+                    window[i][j] = window[i][j+1];
+                }
             }
 
-            // Load from Line Buffers using a safe temp column (fixes memory dependencies)
-            pixel_t col[6];
-            #pragma HLS ARRAY_PARTITION variable=col complete dim=0
+            // 2. Read from BRAM EXACTLY ONCE per row and cache into temporary registers
             int c_idx = (c < WIDTH) ? c : WIDTH - 1;
-            for (int i = 0; i < 6; i++) {
-                col[i] = line_buf[i][c_idx];
-                window[i][6] = col[i];
-            }
-            window[6][6] = new_pix;
+            pixel_t col_val0 = line_buf[0][c_idx];
+            pixel_t col_val1 = line_buf[1][c_idx];
+            pixel_t col_val2 = line_buf[2][c_idx];
+            pixel_t col_val3 = line_buf[3][c_idx];
 
-            // Update Line Buffers
+            // 3. Load the Window using the cached registers (Zero BRAM ports used here)
+            window[0][4] = col_val0;
+            window[1][4] = col_val1;
+            window[2][4] = col_val2;
+            window[3][4] = col_val3;
+            window[4][4] = new_pix;
+
+            // 4. Update BRAM Line Buffers using the cached registers (1 Write port used here)
             if (c < WIDTH) {
-                for (int i = 0; i < 5; i++) line_buf[i][c] = col[i + 1];
-                line_buf[5][c] = new_pix;
+                line_buf[0][c] = col_val1; // Shift using the variable, not a BRAM read!
+                line_buf[1][c] = col_val2;
+                line_buf[2][c] = col_val3;
+                line_buf[3][c] = new_pix;
             }
-
-            // Output Phase
-            if (r >= 3 && c >= 3) {
-                int out_r = r - 3; int out_c = c - 3;
-                if (out_r < 3 || out_r >= HEIGHT - 3 || out_c < 3 || out_c >= WIDTH - 3) {
-                    stream_out.write(window[3][3]); 
+            // 4. Compute and Write (Phase delayed by 2 pixels)
+            if (r >= 2 && c >= 2) {
+                int out_r = r - 2; 
+                int out_c = c - 2;
+                
+                if (out_r < 2 || out_r >= HEIGHT - 2 || out_c < 2 || out_c >= WIDTH - 2) {
+                    stream_out.write(window[2][2]); // Pass through border
                 } else {
-                    calc_t sum = 0;
-                    for (int kr = 0; kr < 7; kr++) {
-                        for (int kc = 0; kc < 7; kc++) sum += window[kr][kc] * kernel[kr][kc];
+                    // Flatten the window into fully partitioned registers
+                    pixel_t flat_window[25];
+                    #pragma HLS ARRAY_PARTITION variable=flat_window complete dim=1
+                    
+                    int idx = 0;
+                    for (int kr = 0; kr < 5; kr++) {
+                        for (int kc = 0; kc < 5; kc++) {
+                            flat_window[idx++] = window[kr][kc];
+                        }
                     }
-                    stream_out.write((pixel_t)sum);
+
+                    // Hardware Sorting Network (Fully Unrolled Compare-and-Swap)
+                    // The compiler turns this into pure combinational logic!
+                    for (int i = 0; i < 13; i++) { 
+                        #pragma HLS UNROLL
+                        // We only need to sort halfway to guarantee the median is at index 12
+                        for (int j = i + 1; j < 25; j++) {
+                            #pragma HLS UNROLL
+                            if (flat_window[i] > flat_window[j]) {
+                                pixel_t temp = flat_window[i];
+                                flat_window[i] = flat_window[j];
+                                flat_window[j] = temp;
+                            }
+                        }
+                    }
+                    
+                    // The 12th index now holds the guaranteed median
+                    stream_out.write(flat_window[12]);
                 }
             }
         }
@@ -131,9 +156,103 @@ void kernel1_gaussian_blur_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixe
 }
 
 // ---------------------------------------------------------
-// Kernel 2: Sobel Gradients
+// Kernel 3: Bilateral Filter (Optimized Stream)
+// Phase Shift: 2 pixels
 // ---------------------------------------------------------
-void kernel2_sobel_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_x, hls::stream<pixel_t>& stream_y) {
+void kernel3_bilateral_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_out) {
+    
+    const int spatial_w[5][5] = {
+        { 1,  4,  7,  4,  1}, { 4, 16, 26, 16,  4}, { 7, 26, 41, 26,  7},
+        { 4, 16, 26, 16,  4}, { 1,  4,  7,  4,  1}
+    };
+
+    const int color_w_lut[32] = {
+        255, 245, 220, 183, 141, 101, 67, 41, 23, 12, 6, 3, 1, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+
+    static pixel_t line_buf[4][WIDTH];
+    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
+    pixel_t window[5][5];
+    #pragma HLS ARRAY_PARTITION variable=window complete dim=0
+
+    // Extend loop by 2 to flush the 5x5 window
+    for (int r = 0; r < HEIGHT + 2; r++) {
+        for (int c = 0; c < WIDTH + 2; c++) {
+            #pragma HLS PIPELINE II=1
+
+            pixel_t new_pix = 0;
+            if (r < HEIGHT && c < WIDTH) new_pix = stream_in.read();
+
+            // 1. Shift Window Left
+            for (int i = 0; i < 5; i++) {
+                for (int j = 0; j < 4; j++) {
+                    window[i][j] = window[i][j+1];
+                }
+            }
+
+            // 2. Read from BRAM EXACTLY ONCE per row and cache into temporary registers
+            int c_idx = (c < WIDTH) ? c : WIDTH - 1;
+            pixel_t col_val0 = line_buf[0][c_idx];
+            pixel_t col_val1 = line_buf[1][c_idx];
+            pixel_t col_val2 = line_buf[2][c_idx];
+            pixel_t col_val3 = line_buf[3][c_idx];
+
+            // 3. Load the Window using the cached registers (Zero BRAM ports used here)
+            window[0][4] = col_val0;
+            window[1][4] = col_val1;
+            window[2][4] = col_val2;
+            window[3][4] = col_val3;
+            window[4][4] = new_pix;
+
+            // 4. Update BRAM Line Buffers using the cached registers (1 Write port used here)
+            if (c < WIDTH) {
+                line_buf[0][c] = col_val1; // Shift using the variable, not a BRAM read!
+                line_buf[1][c] = col_val2;
+                line_buf[2][c] = col_val3;
+                line_buf[3][c] = new_pix;
+            }
+
+            // 4. Compute and Write (Phase delayed by 2 pixels)
+            if (r >= 2 && c >= 2) {
+                int out_r = r - 2; 
+                int out_c = c - 2;
+                
+                if (out_r < 2 || out_r >= HEIGHT - 2 || out_c < 2 || out_c >= WIDTH - 2) {
+                    stream_out.write(window[2][2]); // Pass through border
+                } else {
+                    int center_val = (int)window[2][2];
+                    int val_sum = 0;
+                    int weight_sum = 0;
+
+                    // Fully unrolled parallel multiplication
+                    for (int kr = 0; kr < 5; kr++) {
+                        for (int kc = 0; kc < 5; kc++) {
+                            int neighbor_val = (int)window[kr][kc];
+                            
+                            int raw_diff = center_val - neighbor_val;
+                            int diff = (raw_diff < 0 ? -raw_diff : raw_diff) >> 3;
+
+                            if (diff > 31) diff = 31;
+                            
+                            int w = spatial_w[kr][kc] * color_w_lut[diff];
+                            val_sum += neighbor_val * w;
+                            weight_sum += w;
+                        }
+                    }
+                    
+                    // Hardware Pipelined Divider instantiated here
+                    stream_out.write((pixel_t)(val_sum / weight_sum));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------
+// Kernel 4: Sobel Gradients
+// ---------------------------------------------------------
+void kernel4_sobel_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_x, hls::stream<pixel_t>& stream_y) {
     coef_t sobel_x[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
     coef_t sobel_y[3][3] = {{ 1, 2, 1}, { 0, 0, 0}, {-1,-2,-1}};
     #pragma HLS ARRAY_PARTITION variable=sobel_x complete dim=0
@@ -187,9 +306,9 @@ void kernel2_sobel_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& st
 }
 
 // ---------------------------------------------------------
-// Kernel 3: Magnitude & Direction
+// Kernel 5: Magnitude & Direction
 // ---------------------------------------------------------
-void kernel3_mag_dir_opt(hls::stream<pixel_t>& stream_x, hls::stream<pixel_t>& stream_y, hls::stream<pixel_t>& stream_mag, hls::stream<pixel_t>& stream_dir) {
+void kernel5_mag_dir_opt(hls::stream<pixel_t>& stream_x, hls::stream<pixel_t>& stream_y, hls::stream<pixel_t>& stream_mag, hls::stream<pixel_t>& stream_dir) {
     // 1-to-1 processing. No window/delay required.
     for (int i = 0; i < HEIGHT * WIDTH; i++) {
         #pragma HLS PIPELINE II=1
@@ -216,9 +335,9 @@ void kernel3_mag_dir_opt(hls::stream<pixel_t>& stream_x, hls::stream<pixel_t>& s
 }
 
 // ---------------------------------------------------------
-// Kernel 4: Non-Maximum Suppression
+// Kernel 6: Non-Maximum Suppression
 // ---------------------------------------------------------
-void kernel4_nms_opt(hls::stream<pixel_t>& stream_mag, hls::stream<pixel_t>& stream_dir, hls::stream<pixel_t>& stream_out) {
+void kernel6_nms_opt(hls::stream<pixel_t>& stream_mag, hls::stream<pixel_t>& stream_dir, hls::stream<pixel_t>& stream_out) {
     static pixel_t mag_buf[2][WIDTH];
     static pixel_t dir_buf[2][WIDTH];
     #pragma HLS ARRAY_PARTITION variable=mag_buf complete dim=1
@@ -279,9 +398,9 @@ void kernel4_nms_opt(hls::stream<pixel_t>& stream_mag, hls::stream<pixel_t>& str
 }
 
 // ---------------------------------------------------------
-// Kernel 5: Adaptive Hysteresis
+// Kernel 7: Adaptive Hysteresis
 // ---------------------------------------------------------
-void kernel5_hysteresis_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_out) {
+void kernel7_hysteresis_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_out) {
     static pixel_t line_buf[4][WIDTH];
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
     pixel_t window[5][5];
@@ -349,10 +468,10 @@ void kernel5_hysteresis_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t
 
 
 // ---------------------------------------------------------
-// Kernel 6: Morphological Dilation (Optimized Stream)
+// Kernel 8: Morphological Dilation (Optimized Stream)
 // Phase Shift: 1 pixel
 // ---------------------------------------------------------
-void kernel6_dilation_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_out) {
+void kernel8_dilation_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>& stream_out) {
     static pixel_t line_buf[2][WIDTH];
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
     pixel_t window[3][3];
@@ -408,7 +527,7 @@ void kernel6_dilation_opt(hls::stream<pixel_t>& stream_in, hls::stream<pixel_t>&
 }
 
 // ---------------------------------------------------------
-// Top-Level Function
+// Top-Level Function (Optimized 8-Stage Stream)
 // ---------------------------------------------------------
 void top_kernel(
     pixel_t img_r[HEIGHT][WIDTH], 
@@ -416,46 +535,50 @@ void top_kernel(
     pixel_t img_b[HEIGHT][WIDTH], 
     pixel_t img_out[HEIGHT][WIDTH]
 ) {
+    // This pragma tells the FPGA to run all 8 kernels simultaneously
     #pragma HLS DATAFLOW
 
-    // Instantiate elastic FIFOs
+    // 1. Instantiate elastic FIFOs
     hls::stream<pixel_t> stream_r("r_in");
     hls::stream<pixel_t> stream_g("g_in");
     hls::stream<pixel_t> stream_b("b_in");
-    hls::stream<pixel_t> stream_gray("gray_out"); // Connects K0 to K1
     
-    hls::stream<pixel_t> stream_k1("k1");
-    hls::stream<pixel_t> stream_k2x("k2x");
-    hls::stream<pixel_t> stream_k2y("k2y");
-    hls::stream<pixel_t> stream_k3mag("k3mag");
-    hls::stream<pixel_t> stream_k3dir("k3dir");
-    hls::stream<pixel_t> stream_k4("k4");
-    hls::stream<pixel_t> stream_k5("k5"); 
-    hls::stream<pixel_t> stream_out("out");
+    hls::stream<pixel_t> stream_gray("gray");     // K0 to K1
+    hls::stream<pixel_t> stream_median("median"); // K1 to K2
+    hls::stream<pixel_t> stream_blur("blur");     // K2 to K3
+    hls::stream<pixel_t> stream_sobel_x("sob_x"); // K3 to K4
+    hls::stream<pixel_t> stream_sobel_y("sob_y"); // K3 to K4
+    hls::stream<pixel_t> stream_mag("mag");       // K4 to K5
+    hls::stream<pixel_t> stream_dir("dir");       // K4 to K5
+    hls::stream<pixel_t> stream_nms("nms");       // K5 to K6
+    hls::stream<pixel_t> stream_hyst("hyst");     // K6 to K7
+    hls::stream<pixel_t> stream_out("out");       // K7 to output
 
-    // Maintain depth=512 to prevent deadlocks
+    // 2. Maintain depth=512 to prevent deadlocks
     #pragma HLS STREAM variable=stream_r depth=512
     #pragma HLS STREAM variable=stream_g depth=512
     #pragma HLS STREAM variable=stream_b depth=512
     #pragma HLS STREAM variable=stream_gray depth=512
-    #pragma HLS STREAM variable=stream_k1 depth=512
-    #pragma HLS STREAM variable=stream_k2x depth=512
-    #pragma HLS STREAM variable=stream_k2y depth=512
-    #pragma HLS STREAM variable=stream_k3mag depth=512
-    #pragma HLS STREAM variable=stream_k3dir depth=512
-    #pragma HLS STREAM variable=stream_k4 depth=512
-    #pragma HLS STREAM variable=stream_k5 depth=512
+    #pragma HLS STREAM variable=stream_median depth=512
+    #pragma HLS STREAM variable=stream_blur depth=512
+    #pragma HLS STREAM variable=stream_sobel_x depth=512
+    #pragma HLS STREAM variable=stream_sobel_y depth=512
+    #pragma HLS STREAM variable=stream_mag depth=512
+    #pragma HLS STREAM variable=stream_dir depth=512
+    #pragma HLS STREAM variable=stream_nms depth=512
+    #pragma HLS STREAM variable=stream_hyst depth=512
     #pragma HLS STREAM variable=stream_out depth=512
 
     read_input_rgb(img_r, img_g, img_b, stream_r, stream_g, stream_b);
-    
-    kernel0_rgb_to_ycbcr_opt(stream_r, stream_g, stream_b, stream_gray);
-    kernel1_gaussian_blur_opt(stream_gray, stream_k1);
-    kernel2_sobel_opt(stream_k1, stream_k2x, stream_k2y);
-    kernel3_mag_dir_opt(stream_k2x, stream_k2y, stream_k3mag, stream_k3dir);
-    kernel4_nms_opt(stream_k3mag, stream_k3dir, stream_k4);
-    kernel5_hysteresis_opt(stream_k4, stream_k5); 
-    kernel6_dilation_opt(stream_k5, stream_out); 
+
+    kernel1_rgb_to_ycbcr_opt(stream_r, stream_g, stream_b, stream_gray);
+    kernel2_median_opt(stream_gray, stream_median);
+    kernel3_bilateral_opt(stream_median, stream_blur);
+    kernel4_sobel_opt(stream_blur, stream_sobel_x, stream_sobel_y);
+    kernel5_mag_dir_opt(stream_sobel_x, stream_sobel_y, stream_mag, stream_dir);
+    kernel6_nms_opt(stream_mag, stream_dir, stream_nms);
+    kernel7_hysteresis_opt(stream_nms, stream_hyst); 
+    kernel8_dilation_opt(stream_hyst, stream_out); 
     
     write_output(stream_out, img_out);
 }
