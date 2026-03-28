@@ -1,9 +1,10 @@
 #include "dcl.h"
+#include <cmath> // For std::abs
 
 // ---------------------------------------------------------
-// Kernel 0: Full YCbCr Color Space Converter (Baseline)
+// Kernel 1: Full YCbCr Color Space Converter (Baseline)
 // ---------------------------------------------------------
-void kernel0_rgb_to_ycbcr(
+void kernel1_rgb_to_ycbcr(
     pixel_t img_r[HEIGHT][WIDTH], 
     pixel_t img_g[HEIGHT][WIDTH], 
     pixel_t img_b[HEIGHT][WIDTH], 
@@ -36,46 +37,103 @@ void kernel0_rgb_to_ycbcr(
 }
 
 // ---------------------------------------------------------
-// Kernel 1: 7x7 Gaussian Blur (High-Fidelity Noise Reduction)
-// Massively increases baseline cycle count via 49 MACs per pixel.
+// Kernel 2: Median Filter (Baseline)
 // ---------------------------------------------------------
-void kernel1_gaussian_blur(pixel_t img_in[HEIGHT][WIDTH], pixel_t stage1[HEIGHT][WIDTH]) {
-    // 7x7 Gaussian Kernel Approximation (Sum = ~1.0)
-    coef_t kernel[7][7] = {
-        {0.0000, 0.0002, 0.0011, 0.0018, 0.0011, 0.0002, 0.0000},
-        {0.0002, 0.0029, 0.0130, 0.0215, 0.0130, 0.0029, 0.0002},
-        {0.0011, 0.0130, 0.0585, 0.0965, 0.0585, 0.0130, 0.0011},
-        {0.0018, 0.0215, 0.0965, 0.1591, 0.0965, 0.0215, 0.0018},
-        {0.0011, 0.0130, 0.0585, 0.0965, 0.0585, 0.0130, 0.0011},
-        {0.0002, 0.0029, 0.0130, 0.0215, 0.0130, 0.0029, 0.0002},
-        {0.0000, 0.0002, 0.0011, 0.0018, 0.0011, 0.0002, 0.0000}
-    };
-
+void kernel2_median_baseline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
-            // Boundary safety margin is now 3 pixels for a 7x7 window
-            if (r < 3 || r >= HEIGHT - 3 || c < 3 || c >= WIDTH - 3) {
-                stage1[r][c] = img_in[r][c];
-            } else {
-                calc_t sum = 0;
-                
-                // Deeply nested 7x7 loop (The CPU Bottleneck)
-                for (int kr = -3; kr <= 3; kr++) {
-                    for (int kc = -3; kc <= 3; kc++) {
-                        sum += img_in[r + kr][c + kc] * kernel[kr + 3][kc + 3];
+            // Border handling: pass through unchanged
+            if (r < 2 || r >= HEIGHT - 2 || c < 2 || c >= WIDTH - 2) {
+                img_out[r][c] = img_in[r][c];
+                continue;
+            }
+
+            // Flatten the 5x5 window into a 25-element array
+            pixel_t flat_window[25];
+            int idx = 0;
+            for (int kr = -2; kr <= 2; kr++) {
+                for (int kc = -2; kc <= 2; kc++) {
+                    flat_window[idx++] = img_in[r + kr][c + kc];
+                }
+            }
+
+            // Sort 
+            for (int i = 0; i < 24; i++) {
+                for (int j = 0; j < 24 - i; j++) {
+                    if (flat_window[j] > flat_window[j + 1]) {
+                        pixel_t temp = flat_window[j];
+                        flat_window[j] = flat_window[j + 1];
+                        flat_window[j + 1] = temp;
                     }
                 }
-                stage1[r][c] = (pixel_t)sum;
             }
+
+            // The median of 25 elements is at index 12
+            img_out[r][c] = flat_window[12];
         }
     }
 }
 
 // ---------------------------------------------------------
-// Kernel 2: Sobel Gradients (X and Y directions)
+// Kernel 3: Bilateral Filter
 // ---------------------------------------------------------
-void kernel2_sobel_gradients(pixel_t stage1[HEIGHT][WIDTH], pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2_y[HEIGHT][WIDTH]) {
+void kernel3_bilateral_baseline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
+    
+    // 5x5 Spatial Gaussian Weights
+    const int spatial_w[5][5] = {
+        { 1,  4,  7,  4,  1},
+        { 4, 16, 26, 16,  4},
+        { 7, 26, 41, 26,  7},
+        { 4, 16, 26, 16,  4},
+        { 1,  4,  7,  4,  1}
+    };
+
+    // 32-Element LUT for Exponential Color Differences
+    const int color_w_lut[32] = {
+        255, 245, 220, 183, 141, 101, 67, 41, 23, 12, 6, 3, 1, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+
+    for (int r = 0; r < HEIGHT; r++) {
+        for (int c = 0; c < WIDTH; c++) {
+            
+            // Border handling (skip edges for simplicity)
+            if (r < 2 || r >= HEIGHT - 2 || c < 2 || c >= WIDTH - 2) {
+                img_out[r][c] = img_in[r][c];
+                continue;
+            }
+
+            int center_val = (int)img_in[r][c];
+            int val_sum = 0;
+            int weight_sum = 0;
+
+            // 5x5 Dynamic Convolution
+            for (int kr = -2; kr <= 2; kr++) {
+                for (int kc = -2; kc <= 2; kc++) {
+                    int neighbor_val = (int)img_in[r + kr][c + kc];
+                    
+                    // Quantize the difference to index the LUT
+                    int diff = std::abs(center_val - neighbor_val) >> 3;
+                    if (diff > 31) diff = 31; // Clamp
+
+                    // Calculate combined weight
+                    int w = spatial_w[kr + 2][kc + 2] * color_w_lut[diff];
+                    
+                    val_sum += neighbor_val * w;
+                    weight_sum += w;
+                }
+            }
+            // Dynamic division (brutally slow on CPU)
+            img_out[r][c] = (pixel_t)(val_sum / weight_sum);
+        }
+    }
+}
+
+// ---------------------------------------------------------
+// Kernel 4: Sobel Gradients (X and Y directions)
+// ---------------------------------------------------------
+void kernel4_sobel_gradients(pixel_t stage1[HEIGHT][WIDTH], pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2_y[HEIGHT][WIDTH]) {
     coef_t sobel_x[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
     coef_t sobel_y[3][3] = {{ 1, 2, 1}, { 0, 0, 0}, {-1,-2,-1}};
 
@@ -102,10 +160,10 @@ void kernel2_sobel_gradients(pixel_t stage1[HEIGHT][WIDTH], pixel_t stage2_x[HEI
 }
 
 // ---------------------------------------------------------
-// Kernel 3: Magnitude & True Gradient Direction
+// Kernel 5: Magnitude & True Gradient Direction
 // Introduces a heavy fixed-point division for every pixel
 // ---------------------------------------------------------
-void kernel3_magnitude_direction(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2_y[HEIGHT][WIDTH], pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir[HEIGHT][WIDTH]) {
+void kernel5_magnitude_direction(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2_y[HEIGHT][WIDTH], pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             calc_t gx = stage2_x[r][c];
@@ -142,9 +200,9 @@ void kernel3_magnitude_direction(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2
 }
 
 // ---------------------------------------------------------
-// Kernel 4: Non-Maximum Suppression (Corrected Baseline)
+// Kernel 6: Non-Maximum Suppression (Corrected Baseline)
 // ---------------------------------------------------------
-void kernel4_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir[HEIGHT][WIDTH], pixel_t stage4[HEIGHT][WIDTH]) {
+void kernel6_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir[HEIGHT][WIDTH], pixel_t stage4[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
@@ -187,10 +245,10 @@ void kernel4_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stag
 }
 
 // ---------------------------------------------------------
-// Kernel 5: Adaptive Thresholding & Edge Tracking (Hysteresis)
+// Kernel 7: Adaptive Thresholding & Edge Tracking (Hysteresis)
 // Introduces a 5x5 local mean calculation before hysteresis.
 // ---------------------------------------------------------
-void kernel5_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
+void kernel7_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
@@ -241,9 +299,9 @@ void kernel5_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][W
 }
 
 // ---------------------------------------------------------
-// Kernel 6: Morphological Dilation (Unoptimized Baseline)
+// Kernel 8: Morphological Dilation (Unoptimized Baseline)
 // ---------------------------------------------------------
-void kernel6_dilation(pixel_t stage5[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
+void kernel8_dilation(pixel_t stage5[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
@@ -283,11 +341,12 @@ void top_kernel(
     static pixel_t buf_C[HEIGHT][WIDTH]; 
     static pixel_t buf_D[HEIGHT][WIDTH]; 
 
-    kernel0_rgb_to_ycbcr(img_r, img_g, img_b, buf_A); 
-    kernel1_gaussian_blur(buf_A, buf_B);         
-    kernel2_sobel_gradients(buf_B, buf_A, buf_C);
-    kernel3_magnitude_direction(buf_A, buf_C, buf_B, buf_D);
-    kernel4_non_max_suppression(buf_B, buf_D, buf_A);
-    kernel5_hysteresis(buf_A, buf_B); 
-    kernel6_dilation(buf_B, img_out); 
+    kernel1_rgb_to_ycbcr(img_r, img_g, img_b, buf_A); 
+    kernel2_median_baseline(buf_A, buf_B);
+    kernel3_bilateral_baseline(buf_B, buf_A);         
+    kernel4_sobel_gradients(buf_A, buf_B, buf_C);
+    kernel5_magnitude_direction(buf_B, buf_C, buf_A, buf_D);
+    kernel6_non_max_suppression(buf_A, buf_D, buf_B);
+    kernel7_hysteresis(buf_B, buf_A); 
+    kernel8_dilation(buf_A, img_out);
 }
