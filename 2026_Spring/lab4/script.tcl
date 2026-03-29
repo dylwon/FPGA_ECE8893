@@ -4,7 +4,12 @@ open_component project_1
 set_top top_kernel
 
 # add source file
+
+# UNCOMMENT THIS LINE TO SELECT OPTIMIZED DESIGN
 add_files top.cpp
+
+# UNCOMMENT THIS LINE TO SELECT BASELINE DESIGN
+# add_files baseline.cpp
 
 # add testbench
 add_files -tb host.cpp
@@ -14,10 +19,9 @@ config_unroll -tripcount_threshold 0
 config_compile -pipeline_loops 0
 
 # FPGA part and clock configuration
+# default frequency is 100 MHz
 set_part {xczu3eg-sbva484-1-e}
-
-# Default clock period to 10ns
-create_clock -period 10.0 -name default
+#create_clock -period 4 -name default
 
 # C synthesis for HLS design, generating RTL
 csynth_design
@@ -29,7 +33,7 @@ cosim_design
 # Note: -flow syn performs RTL synthesis; 
 # -flow impl performs both RTL synthesis and implementation, including a detailed place and route of the RTL netlist.
 # implementation flow will take much longer time
-export_design -format ip_catalog -flow impl
 #export_design -format ip_catalog
+export_design -format ip_catalog -flow impl
 
 exit
