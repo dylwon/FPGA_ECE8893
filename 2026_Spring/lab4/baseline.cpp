@@ -1,9 +1,9 @@
 #include "dcl.h"
-#include <cmath> // For std::abs
+#include <cmath>
 
-// ---------------------------------------------------------
-// Kernel 1: Full YCbCr Color Space Converter (Baseline)
-// ---------------------------------------------------------
+// ------------------------------------------------------------------
+// Kernel 1: Full YCbCr Color Space Converter (ITU-R BT.601 standard)
+// ------------------------------------------------------------------
 void kernel1_rgb_to_ycbcr(
     pixel_t img_r[HEIGHT][WIDTH], 
     pixel_t img_g[HEIGHT][WIDTH], 
@@ -17,33 +17,34 @@ void kernel1_rgb_to_ycbcr(
             int green = (int)img_g[r][c];
             int blue = (int)img_b[r][c];
 
-            // Step 1: ITU-R BT.601 Matrix Multiplication (Bit-shifted by 8)
-            int y_calc = (66 * red + 129 * green + 25 * blue + 4096) >> 8;
+            // Calculates the Luma component (Y)
+            int y = (66 * red + 129 * green + 25 * blue + 4096) >> 8;
 
-            // Step 2: Broadcast Legal Saturation
-            if (y_calc < 16) y_calc = 16;
-            else if (y_calc > 235) y_calc = 235;
+            // Ensures Luma stays within Studio Swing range
+            if (y < 16) y = 16;
+            else if (y > 235) y = 235;
 
-            // Step 3: Dynamic Range Normalization (Stretch 16-235 to 0-255)
-            int normalized_gray = ((y_calc - 16) * 298) >> 8;
+            // Dynamic Range Normalization (Stretch 16-235 to 0-255)
+            int normalized_gray = ((y - 16) * 298) >> 8;
 
-            // Final safety clamp
+            // Clamp to ensure final output is within 0-255
             if (normalized_gray < 0) normalized_gray = 0;
             else if (normalized_gray > 255) normalized_gray = 255;
 
+            // Write the final grayscale pixel value
             img_gray[r][c] = (pixel_t)normalized_gray;
         }
     }
 }
 
 // ---------------------------------------------------------
-// Kernel 2: Median Filter (Baseline)
+// Kernel 2: Median Filter
 // ---------------------------------------------------------
 void kernel2_median_baseline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
-            // Border handling: pass through unchanged
+            // Skip border pixels
             if (r < 2 || r >= HEIGHT - 2 || c < 2 || c >= WIDTH - 2) {
                 img_out[r][c] = img_in[r][c];
                 continue;
@@ -58,7 +59,7 @@ void kernel2_median_baseline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIG
                 }
             }
 
-            // Sort 
+            // Sort the array
             for (int i = 0; i < 24; i++) {
                 for (int j = 0; j < 24 - i; j++) {
                     if (flat_window[j] > flat_window[j + 1]) {
@@ -69,7 +70,7 @@ void kernel2_median_baseline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[HEIG
                 }
             }
 
-            // The median of 25 elements is at index 12
+            // Grabs the median at index 12 from a sorted array of 25 elements
             img_out[r][c] = flat_window[12];
         }
     }
@@ -89,7 +90,7 @@ void kernel3_bilateral_baseline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[H
         { 1,  4,  7,  4,  1}
     };
 
-    // 32-Element LUT for Exponential Color Differences
+    // Look-Up Table for pixel color weights
     const int color_w_lut[32] = {
         255, 245, 220, 183, 141, 101, 67, 41, 23, 12, 6, 3, 1, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
@@ -98,7 +99,7 @@ void kernel3_bilateral_baseline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[H
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
-            // Border handling (skip edges for simplicity)
+            // Skip border pixels
             if (r < 2 || r >= HEIGHT - 2 || c < 2 || c >= WIDTH - 2) {
                 img_out[r][c] = img_in[r][c];
                 continue;
@@ -115,7 +116,7 @@ void kernel3_bilateral_baseline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[H
                     
                     // Quantize the difference to index the LUT
                     int diff = std::abs(center_val - neighbor_val) >> 3;
-                    if (diff > 31) diff = 31; // Clamp
+                    if (diff > 31) diff = 31;
 
                     // Calculate combined weight
                     int w = spatial_w[kr + 2][kc + 2] * color_w_lut[diff];
@@ -124,27 +125,33 @@ void kernel3_bilateral_baseline(pixel_t img_in[HEIGHT][WIDTH], pixel_t img_out[H
                     weight_sum += w;
                 }
             }
-            // Dynamic division (brutally slow on CPU)
+
+            // Stores the normalized pixel value
             img_out[r][c] = (pixel_t)(val_sum / weight_sum);
         }
     }
 }
 
 // ---------------------------------------------------------
-// Kernel 4: Sobel Gradients (X and Y directions)
+// Kernel 4: Sobel Gradients
 // ---------------------------------------------------------
 void kernel4_sobel_gradients(pixel_t stage1[HEIGHT][WIDTH], pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2_y[HEIGHT][WIDTH]) {
-    coef_t sobel_x[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
-    coef_t sobel_y[3][3] = {{ 1, 2, 1}, { 0, 0, 0}, {-1,-2,-1}};
+    coef_t sobel_x[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}}; // Horizontal gradient
+    coef_t sobel_y[3][3] = {{ 1, 2, 1}, { 0, 0, 0}, {-1,-2,-1}}; // Vertical gradient
 
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
+
+            // Pads the borders with zeroes
             if (r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1) {
                 stage2_x[r][c] = 0;
                 stage2_y[r][c] = 0;
-            } else {
+            } 
+            else {
                 calc_t sum_x = 0;
                 calc_t sum_y = 0;
+
+                // Performs X and Y convolutions with the Sobel matrices
                 for (int kr = -1; kr <= 1; kr++) {
                     for (int kc = -1; kc <= 1; kc++) {
                         pixel_t val = stage1[r + kr][c + kc];
@@ -152,6 +159,8 @@ void kernel4_sobel_gradients(pixel_t stage1[HEIGHT][WIDTH], pixel_t stage2_x[HEI
                         sum_y += val * sobel_y[kr + 1][kc + 1];
                     }
                 }
+
+                // Stores the row and column pixel color gradients
                 stage2_x[r][c] = (pixel_t)sum_x;
                 stage2_y[r][c] = (pixel_t)sum_y;
             }
@@ -160,8 +169,7 @@ void kernel4_sobel_gradients(pixel_t stage1[HEIGHT][WIDTH], pixel_t stage2_x[HEI
 }
 
 // ---------------------------------------------------------
-// Kernel 5: Magnitude & True Gradient Direction
-// Introduces a heavy fixed-point division for every pixel
+// Kernel 5: Magnitude Gradient Direction
 // ---------------------------------------------------------
 void kernel5_magnitude_direction(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2_y[HEIGHT][WIDTH], pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
@@ -169,21 +177,18 @@ void kernel5_magnitude_direction(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2
             calc_t gx = stage2_x[r][c];
             calc_t gy = stage2_y[r][c];
             
-            // Keep the L1 norm for magnitude
+            // Calculates Manhattan Distance for distance approximation
             calc_t abs_gx = (gx < 0) ? (calc_t)(-gx) : gx;
             calc_t abs_gy = (gy < 0) ? (calc_t)(-gy) : gy;
             stage3_mag[r][c] = (pixel_t)(abs_gx + abs_gy);
 
-            // --- THE BOTTLENECK: True Slope Division ---
+            // Categorize directions into 0, 45, 90, 135 degrees using tangent approximations
             pixel_t dir = 0;
             if (gx == 0) {
-                // Avoid divide-by-zero
                 dir = 90; 
             } else {
-                // Massive hardware stall here
                 calc_t slope = gy / gx; 
 
-                // Categorize into 0, 45, 90, 135 degrees using tangent approximations
                 if (slope > (calc_t)-0.414 && slope <= (calc_t)0.414) {
                     dir = 0;
                 } else if (slope > (calc_t)0.414 && slope <= (calc_t)2.414) {
@@ -206,7 +211,7 @@ void kernel6_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stag
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
-            // Boundary safety check
+            // Pads borders with zeroes
             if (r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1) {
                 stage4[r][c] = 0;
                 continue;
@@ -216,6 +221,7 @@ void kernel6_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stag
             pixel_t dir = stage3_dir[r][c];
             pixel_t mag1 = 0, mag2 = 0;
 
+            // Compares pixel with its neighbors in the direction of the gradient
             if (dir == 0) { 
                 // Horizontal edge: check left and right
                 mag1 = stage3_mag[r][c - 1];
@@ -245,20 +251,19 @@ void kernel6_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stag
 }
 
 // ---------------------------------------------------------
-// Kernel 7: Adaptive Thresholding & Edge Tracking (Hysteresis)
-// Introduces a 5x5 local mean calculation before hysteresis.
+// Kernel 7: Hysteresis Thresholding
 // ---------------------------------------------------------
 void kernel7_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
-            // Boundary safety margin is 2 pixels for a 5x5 window
+            // Pads borders with zeroes
             if (r < 2 || r >= HEIGHT - 2 || c < 2 || c >= WIDTH - 2) {
                 img_out[r][c] = 0;
                 continue;
             }
 
-            // --- Step 1: Calculate 5x5 Local Mean ---
+            // Calculates local mean for adaptive thresholding
             calc_t local_sum = 0;
             for (int kr = -2; kr <= 2; kr++) {
                 for (int kc = -2; kc <= 2; kc++) {
@@ -268,25 +273,27 @@ void kernel7_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][W
 
             pixel_t local_mean = (pixel_t)(local_sum / (calc_t)25);
 
-            // --- Step 2: Set Dynamic Thresholds ---
+            // Sets dynamic thresholds based on local mean
             pixel_t HIGH_THRESH = local_mean + (pixel_t)15;
             pixel_t LOW_THRESH  = local_mean - (pixel_t)5;
             
             pixel_t center_pixel = stage4[r][c];
             
-            // --- Step 3: Hysteresis Logic ---
+            // Applies the hysteresis filter
             if (center_pixel >= HIGH_THRESH) {
                 img_out[r][c] = 255;
             } else if (center_pixel < LOW_THRESH) {
                 img_out[r][c] = 0;
             } else {
                 bool connected = false;
-                // Standard 3x3 check for connected strong edges
+                // Checks for strong edge connectivity around the pixel
                 for (int kr = -1; kr <= 1; kr++) {
                     for (int kc = -1; kc <= 1; kc++) {
+
+                        // Skips center pixel
                         if (kr == 0 && kc == 0) continue; 
                         
-                        // It must be connected to a pixel that is ALSO above the new dynamic high threshold
+                        // Pixel must also be connected to a strong edge to be considered an edge
                         if (stage4[r + kr][c + kc] >= HIGH_THRESH) {
                             connected = true;
                         }
@@ -299,29 +306,31 @@ void kernel7_hysteresis(pixel_t stage4[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][W
 }
 
 // ---------------------------------------------------------
-// Kernel 8: Morphological Dilation (Unoptimized Baseline)
+// Kernel 8: Morphological Dilation
 // ---------------------------------------------------------
 void kernel8_dilation(pixel_t stage5[HEIGHT][WIDTH], pixel_t img_out[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
         for (int c = 0; c < WIDTH; c++) {
             
-            // Boundary safety margin: 1 pixel for a 3x3 window
+            // Pads borders with zeroes
             if (r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1) {
                 img_out[r][c] = 0;
                 continue;
             }
 
-            // Dilation logic: 3x3 neighborhood search
+            // Dilate by connecting 3x3 edge pixels
             pixel_t max_val = 0;
             for (int kr = -1; kr <= 1; kr++) {
                 for (int kc = -1; kc <= 1; kc++) {
-                    // If any neighbor is a strong edge (255), the center becomes an edge
+
+                    // Sets center pixel to be an edge
                     if (stage5[r + kr][c + kc] == 255) {
                         max_val = 255;
                     }
                 }
             }
             
+            // Stores the binary pixel value after dilation
             img_out[r][c] = max_val;
         }
     }
