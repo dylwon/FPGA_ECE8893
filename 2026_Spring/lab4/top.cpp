@@ -194,15 +194,31 @@ void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>
                                 for (int j = 0; j < 24; j += 2) {
                                     #pragma HLS UNROLL
                                     pixel_t a = flat[j]; pixel_t b = flat[j+1];
-                                    flat[j]   = (a > b) ? b : a;
-                                    flat[j+1] = (a > b) ? a : b;
+                                    
+                                    // Force a pipeline register by using a functional 'add' operation
+                                    bool is_greater_raw = (a > b);
+                                    bool is_greater;
+
+                                    #pragma HLS bind_op variable=is_greater op=add impl=fabric latency=1
+                                    is_greater = is_greater_raw + 0;
+                                    
+                                    flat[j]   = is_greater ? b : a;
+                                    flat[j+1] = is_greater ? a : b;
                                 }
                             } else { // Odd phase
                                 for (int j = 1; j < 24; j += 2) {
                                     #pragma HLS UNROLL
                                     pixel_t a = flat[j]; pixel_t b = flat[j+1];
-                                    flat[j]   = (a > b) ? b : a;
-                                    flat[j+1] = (a > b) ? a : b;
+                                    
+                                    // Force a pipeline register by using a functional 'add' operation
+                                    bool is_greater_raw = (a > b);
+                                    bool is_greater;
+
+                                    #pragma HLS bind_op variable=is_greater op=add impl=fabric latency=1
+                                    is_greater = is_greater_raw + 0;
+                                    
+                                    flat[j]   = is_greater ? b : a;
+                                    flat[j+1] = is_greater ? a : b;
                                 }
                             }
                         }
@@ -316,7 +332,13 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
                                 weight_sum += w;
                             }
                         }
-                        out_arr[p] = (pixel_t)(val_sum / weight_sum);
+                        int div_result;
+                        // Force Vitis to add 4 layers of pipeline registers inside the divider
+                        #pragma HLS bind_op variable=div_result op=sdiv impl=auto
+
+                        div_result = val_sum / weight_sum;
+
+                        out_arr[p] = (pixel_t)div_result;
                     }
                 }
                 
@@ -441,8 +463,13 @@ void kernel5_mag_dir_simd(
             if (curr_gx == 0) {
                 dir = 90; 
             } else {
-                // Synthesizing 4 parallel dividers here
-                calc_t slope = curr_gy / curr_gx; 
+                // 1. Force the synthesizer to take 4 cycles for this division!
+                // This breaks the 9ns critical path.
+                calc_t slope;
+                #pragma HLS bind_op variable=slope op=sdiv impl=auto
+                slope = curr_gy / curr_gx; 
+
+                // 2. Let ap_fixed handle the fractions natively at compile time
                 if (slope > (calc_t)-0.414 && slope <= (calc_t)0.414) dir = 0;
                 else if (slope > (calc_t)0.414 && slope <= (calc_t)2.414) dir = 45;
                 else if (slope < (calc_t)-0.414 && slope >= (calc_t)-2.414) dir = 135;
@@ -731,10 +758,10 @@ void top_kernel(
     pixel_t img_b[HEIGHT][WIDTH], 
     pixel_t img_out[HEIGHT][WIDTH]
 ) {
-    #pragma HLS interface m_axi port=img_r register offset=slave bundle=gmem0
-    #pragma HLS interface m_axi port=img_g register offset=slave bundle=gmem1
-    #pragma HLS interface m_axi port=img_b register offset=slave bundle=gmem2
-    #pragma HLS interface m_axi port=img_out register offset=slave bundle=gmem3
+    #pragma HLS interface m_axi port=img_r offset=slave bundle=gmem0
+    #pragma HLS interface m_axi port=img_g offset=slave bundle=gmem1
+    #pragma HLS interface m_axi port=img_b offset=slave bundle=gmem2
+    #pragma HLS interface m_axi port=img_out offset=slave bundle=gmem3
     #pragma HLS interface s_axilite port=return
 
     #pragma HLS DATAFLOW
