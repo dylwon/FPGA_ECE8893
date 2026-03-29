@@ -205,7 +205,7 @@ void kernel5_magnitude_direction(pixel_t stage2_x[HEIGHT][WIDTH], pixel_t stage2
 }
 
 // ---------------------------------------------------------
-// Kernel 6: Non-Maximum Suppression (Corrected Baseline)
+// Kernel 6: Non-Maximum Suppression
 // ---------------------------------------------------------
 void kernel6_non_max_suppression(pixel_t stage3_mag[HEIGHT][WIDTH], pixel_t stage3_dir[HEIGHT][WIDTH], pixel_t stage4[HEIGHT][WIDTH]) {
     for (int r = 0; r < HEIGHT; r++) {
