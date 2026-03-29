@@ -193,18 +193,14 @@ void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>
                             if (i % 2 == 0) { // Even phase
                                 for (int j = 0; j < 24; j += 2) {
                                     #pragma HLS UNROLL
-                                    ap_uint<8> a = flat_window[i];
-                                    ap_uint<8> b = flat_window[j];
-                                    
+                                    pixel_t a = flat[j]; pixel_t b = flat[j+1];
                                     flat[j]   = (a > b) ? b : a;
                                     flat[j+1] = (a > b) ? a : b;
                                 }
                             } else { // Odd phase
                                 for (int j = 1; j < 24; j += 2) {
                                     #pragma HLS UNROLL
-                                    ap_uint<8> a = flat_window[i];
-                                    ap_uint<8> b = flat_window[j];
-
+                                    pixel_t a = flat[j]; pixel_t b = flat[j+1];
                                     flat[j]   = (a > b) ? b : a;
                                     flat[j+1] = (a > b) ? a : b;
                                 }
@@ -298,8 +294,8 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
                         out_arr[p] = window[2][p + 4]; 
                     } else {
                         int center_val = (int)window[2][p + 4];
-                        ap_uint<24> val_sum = 0;
-                        ap_uint<16> weight_sum = 0;
+                        int val_sum = 0;
+                        int weight_sum = 0;
 
                         // Parallel Multiplier Tree
                         for (int kr = 0; kr < 5; kr++) {
@@ -310,9 +306,10 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
                                 int diff = (raw_diff < 0 ? -raw_diff : raw_diff) >> 3;
                                 if (diff > 31) diff = 31;
                                 
-                                ap_uint<16> w = spatial_w[kr][kc] * color_w_lut[diff];
-                                ap_uint<24> mult_val = neighbor_val * w;
-
+                                int w = spatial_w[kr][kc] * color_w_lut[diff];
+                                
+                                // THE LATENCY TRICK: Break up the long routing paths
+                                int mult_val = neighbor_val * w;
                                 #pragma HLS bind_op variable=mult_val op=mul impl=dsp latency=3
                                 
                                 val_sum += mult_val;
