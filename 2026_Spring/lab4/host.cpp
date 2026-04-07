@@ -367,11 +367,6 @@ int main() {
             
             // Calculate the 1% allowed error threshold
             double allowed_error = 0.01 * std::abs(gold_val);
-            
-            // Small absolute tolerance for small values
-            if (gold_val == 0.0) {
-                allowed_error = 0.05;
-            }
 
             // Check if the difference exceeds the 1% allowed error
             if (diff > allowed_error) {
