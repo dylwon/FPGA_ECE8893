@@ -62,26 +62,6 @@ void read_input_burst(
     }
 }
 
-// ---------------------------------------------------------
-// Helper: 512-Bit AXI Burst Writer
-// ---------------------------------------------------------
-void write_output_burst(hls::stream<pixel_t>& stream_in, pixel_t img_out[HEIGHT][WIDTH]) {
-    super_wide_t *flat_out = (super_wide_t*)img_out;
-    super_wide_t chunk = 0;
-    
-    for (int i = 0; i < HEIGHT * WIDTH; i++) {
-        #pragma HLS PIPELINE II=1
-        pixel_t px = stream_in.read();
-        
-        int bit_idx = (i % 32) * 16;
-        chunk.range(bit_idx + 15, bit_idx) = px.range();
-        
-        if ((i % 32) == 31) {
-            flat_out[i / 32] = chunk;
-            chunk = 0;
-        }
-    }
-}
 
 // ---------------------------------------------------------
 // Helper: Exact BT.601 Golden Math
@@ -310,12 +290,19 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
                         out_arr[p] = window[2][p + 4]; 
                     } else {
                         int center_val = (int)window[2][p + 4];
-                        int val_sum = 0;
-                        int weight_sum = 0;
+                        
+                        // Stage 1: Create arrays to hold the 5 independent row sums
+                        int val_row_sum[5] = {0, 0, 0, 0, 0};
+                        int weight_row_sum[5] = {0, 0, 0, 0, 0};
+                        
+                        #pragma HLS ARRAY_PARTITION variable=val_row_sum complete
+                        #pragma HLS ARRAY_PARTITION variable=weight_row_sum complete
 
-                        // Parallel Multiplier Tree
+                        // Parallel Multiplier & Row-Sum Tree
                         for (int kr = 0; kr < 5; kr++) {
+                            #pragma HLS UNROLL
                             for (int kc = 0; kc < 5; kc++) {
+                                #pragma HLS UNROLL
                                 int neighbor_val = (int)window[kr][p + 2 + kc];
                                 
                                 int raw_diff = center_val - neighbor_val;
@@ -324,18 +311,29 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
                                 
                                 int w = spatial_w[kr][kc] * color_w_lut[diff];
                                 
-                                // THE LATENCY TRICK: Break up the long routing paths
                                 int mult_val = neighbor_val * w;
                                 #pragma HLS bind_op variable=mult_val op=mul impl=dsp latency=3
                                 
-                                val_sum += mult_val;
-                                weight_sum += w;
+                                // Accumulate only within the specific row
+                                val_row_sum[kr] += mult_val;
+                                weight_row_sum[kr] += w;
                             }
                         }
-                        int div_result;
-                        // Force Vitis to add 4 layers of pipeline registers inside the divider
-                        #pragma HLS bind_op variable=div_result op=sdiv impl=auto
+                        
+                        int val_sum = 0;
+                        int weight_sum = 0;
+                        
+                        // --- THE SLICE ---
+                        // Force a pipeline register between the row sums and the final total
+                        #pragma HLS bind_op variable=val_sum op=add impl=fabric latency=1
+                        #pragma HLS bind_op variable=weight_sum op=add impl=fabric latency=1
+                        
+                        // Stage 2: Sum the 5 row registers together
+                        val_sum = val_row_sum[0] + val_row_sum[1] + val_row_sum[2] + val_row_sum[3] + val_row_sum[4];
+                        weight_sum = weight_row_sum[0] + weight_row_sum[1] + weight_row_sum[2] + weight_row_sum[3] + weight_row_sum[4];
 
+                        int div_result;
+                        #pragma HLS bind_op variable=div_result op=sdiv impl=auto
                         div_result = val_sum / weight_sum;
 
                         out_arr[p] = (pixel_t)div_result;
@@ -574,7 +572,7 @@ void kernel6_nms_simd(hls::stream<pixel4_t>& stream_mag, hls::stream<pixel4_t>& 
 }
 
 // ---------------------------------------------------------
-// Kernel 7: Adaptive Hysteresis (4x SIMD Vectorized!)
+// Kernel 7: Adaptive Hysteresis
 // ---------------------------------------------------------
 void kernel7_hysteresis_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>& stream_out) {
     static pixel4_t line_buf[4][WIDTH / 4];
@@ -624,22 +622,46 @@ void kernel7_hysteresis_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel
                     if (out_r < 2 || out_r >= HEIGHT - 2 || out_c < 2 || out_c >= WIDTH - 2) {
                         out_arr[p] = 0;
                     } else {
-                        calc_t local_sum = 0;
+                        // Stage 1: Calculate 5 independent row sums
+                        calc_t row_sums[5] = {0, 0, 0, 0, 0};
+                        #pragma HLS ARRAY_PARTITION variable=row_sums complete
+
                         for (int kr = 0; kr < 5; kr++) {
-                            for (int kc = 0; kc < 5; kc++) local_sum += window[kr][p + 2 + kc];
+                            #pragma HLS UNROLL
+                            for (int kc = 0; kc < 5; kc++) {
+                                #pragma HLS UNROLL
+                                row_sums[kr] += window[kr][p + 2 + kc];
+                            }
                         }
                         
-                        pixel_t local_mean = (pixel_t)(local_sum / (calc_t)25); 
+                        calc_t local_sum = 0;
+                        // --- THE SLICE ---
+                        // Force a pipeline register to break the 25-element adder path
+                        #pragma HLS bind_op variable=local_sum op=add impl=fabric latency=1
+                        
+                        // Stage 2: Sum the 5 rows together
+                        local_sum = row_sums[0] + row_sums[1] + row_sums[2] + row_sums[3] + row_sums[4];
+                        
+                        // Pipeline the division just like we did in Kernel 3 and 5
+                        calc_t mean_div;
+                        #pragma HLS bind_op variable=mean_div op=sdiv impl=auto
+                        mean_div = local_sum / (calc_t)25;
+
+                        pixel_t local_mean = (pixel_t)mean_div; 
                         pixel_t HIGH_THRESH = local_mean + (pixel_t)15;
                         pixel_t LOW_THRESH  = local_mean - (pixel_t)5;
                         pixel_t center_pixel = window[2][p + 4];
                         
-                        if (center_pixel >= HIGH_THRESH) out_arr[p] = 255;
-                        else if (center_pixel < LOW_THRESH) out_arr[p] = 0;
-                        else {
+                        if (center_pixel >= HIGH_THRESH) {
+                            out_arr[p] = 255;
+                        } else if (center_pixel < LOW_THRESH) {
+                            out_arr[p] = 0;
+                        } else {
                             bool connected = false;
                             for (int kr = 1; kr <= 3; kr++) {
+                                #pragma HLS UNROLL
                                 for (int kc = 1; kc <= 3; kc++) {
+                                    #pragma HLS UNROLL
                                     if (kr == 2 && kc == 2) continue; 
                                     if (window[kr][p + 2 + kc] >= HIGH_THRESH) connected = true;
                                 }
@@ -732,22 +754,22 @@ void write_output_burst(hls::stream<pixel4_t>& stream_in, pixel_t img_out[HEIGHT
     super_wide_t *flat_out = (super_wide_t*)img_out;
     super_wide_t chunk = 0;
     
-    // We only loop 16,384 times!
     for (int i = 0; i < (HEIGHT * WIDTH) / 4; i++) {
         #pragma HLS PIPELINE II=1
         pixel4_t vec = stream_in.read();
         
-        // Offset climbs by 64 bits (4x16 bits) every cycle
-        int offset = (i % 8) * 64; 
-        chunk.range(offset + 15, offset + 0)  = vec.p0.range();
-        chunk.range(offset + 31, offset + 16) = vec.p1.range();
-        chunk.range(offset + 47, offset + 32) = vec.p2.range();
-        chunk.range(offset + 63, offset + 48) = vec.p3.range();
+        // Shift existing data right by 64 bits
+        chunk = chunk >> 64;
         
-        // Write to DRAM every 8th cycle (32 pixels filled)
+        // ALWAYS insert the new data at the very top 64 bits!
+        chunk.range(511, 496) = vec.p3.range();
+        chunk.range(495, 480) = vec.p2.range();
+        chunk.range(479, 464) = vec.p1.range();
+        chunk.range(463, 448) = vec.p0.range();
+        
+        // After 8 insertions and shifts, the data is perfectly aligned to write
         if ((i % 8) == 7) {
             flat_out[i / 8] = chunk;
-            chunk = 0;
         }
     }
 }
