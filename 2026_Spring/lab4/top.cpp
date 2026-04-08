@@ -1,16 +1,14 @@
 #include "dcl.h"
 #include <hls_stream.h>
 
-// 1. The 512-bit wide memory line for ultra-fast DRAM burst reads
 typedef ap_uint<512> super_wide_t; 
 
-// 2. The 4x SIMD struct that saves our LUT utilization!
 struct pixel4_t {
     pixel_t p0, p1, p2, p3; 
 };
 
 // ---------------------------------------------------------
-// Helper: 512-Bit AXI Burst Reader (Unpacks to 4x SIMD)
+// 512-Bit AXI Burst Reader
 // ---------------------------------------------------------
 void read_input_burst(
     pixel_t img_r[HEIGHT][WIDTH], 
@@ -26,7 +24,6 @@ void read_input_burst(
 
     super_wide_t chunk_r, chunk_g, chunk_b;
 
-    // Loop runs 16,384 times (HEIGHT * WIDTH / 4)
     for (int i = 0; i < (HEIGHT * WIDTH) / 4; i++) {
         #pragma HLS PIPELINE II=1
         
@@ -37,7 +34,6 @@ void read_input_burst(
             chunk_b = flat_b[i / 8];
         }
         
-        // Offset climbs by 64 bits each iteration (4 pixels * 16 bits)
         int offset = (i % 8) * 64;
         pixel4_t vec_r, vec_g, vec_b;
         
@@ -64,22 +60,36 @@ void read_input_burst(
 
 
 // ---------------------------------------------------------
-// Helper: Exact BT.601 Golden Math
+// BT.601 Conversion
 // ---------------------------------------------------------
 inline pixel_t bt601_convert(pixel_t r_pix, pixel_t g_pix, pixel_t b_pix) {
     #pragma HLS INLINE
-    int red = (int)r_pix; int green = (int)g_pix; int blue = (int)b_pix;
+    int red = (int)r_pix; 
+    int green = (int)g_pix; 
+    int blue = (int)b_pix;
     int y_calc = (66 * red + 129 * green + 25 * blue + 4096) >> 8;
-    if (y_calc < 16) y_calc = 16;
-    else if (y_calc > 235) y_calc = 235;
+
+    if (y_calc < 16) {
+        y_calc = 16;
+    }
+    else if (y_calc > 235) {
+        y_calc = 235;
+    }
+
     int normalized_gray = ((y_calc - 16) * 298) >> 8;
-    if (normalized_gray < 0) normalized_gray = 0;
-    else if (normalized_gray > 255) normalized_gray = 255;
+
+    if (normalized_gray < 0) {
+        normalized_gray = 0;
+    }
+    else if (normalized_gray > 255) {
+        normalized_gray = 255;
+    }
+
     return (pixel_t)normalized_gray;
 }
 
 // ---------------------------------------------------------
-// Kernel 1: YCbCr Converter (4x SIMD)
+// Kernel 1: YCbCr Converter
 // ---------------------------------------------------------
 void kernel1_rgb_to_ycbcr_simd(
     hls::stream<pixel4_t>& stream_r, 
@@ -105,14 +115,13 @@ void kernel1_rgb_to_ycbcr_simd(
 }
 
 // ---------------------------------------------------------
-// Kernel 2: True 25-Element Median (Odd-Even Transposition SIMD)
+// Kernel 2: Odd-Even Median Filter
 // ---------------------------------------------------------
 void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>& stream_out) {
     static pixel4_t line_buf[4][WIDTH / 4];
     #pragma HLS bind_storage variable=line_buf type=ram_t2p impl=bram
     #pragma HLS array_partition variable=line_buf complete dim=1
     
-    // The Wide Window: 5 rows by 12 columns
     pixel_t window[5][12];
     #pragma HLS ARRAY_PARTITION variable=window complete dim=0
 
@@ -125,7 +134,6 @@ void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>
 
             if (r < HEIGHT && c < WIDTH / 4) new_vec = stream_in.read();
 
-            // Shift Wide Window
             for (int i = 0; i < 5; i++) {
                 for (int j = 0; j < 8; j++) window[i][j] = window[i][j+4];
             }
@@ -157,7 +165,7 @@ void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>
                     if (out_r < 2 || out_r >= HEIGHT - 2 || out_c < 2 || out_c >= WIDTH - 2) {
                         out_arr[p] = window[2][p + 4]; 
                     } else {
-                        // 1. Flatten the 5x5 window into a 25-element array
+                        // Flatten the 5x5 window into a 25-element array
                         pixel_t flat[25];
                         #pragma HLS ARRAY_PARTITION variable=flat complete
                         int idx = 0;
@@ -167,7 +175,7 @@ void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>
                             }
                         }
 
-                        // 2. Odd-Even Bubble Sort
+                        // Odd-Even Bubble Sort
                         for (int i = 0; i < 25; i++) {
                             #pragma HLS UNROLL
                             if (i % 2 == 0) { // Even phase
@@ -175,7 +183,6 @@ void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>
                                     #pragma HLS UNROLL
                                     pixel_t a = flat[j]; pixel_t b = flat[j+1];
                                     
-                                    // Force a pipeline register by using a functional 'add' operation
                                     bool is_greater_raw = (a > b);
                                     bool is_greater;
 
@@ -190,7 +197,6 @@ void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>
                                     #pragma HLS UNROLL
                                     pixel_t a = flat[j]; pixel_t b = flat[j+1];
                                     
-                                    // Force a pipeline register by using a functional 'add' operation
                                     bool is_greater_raw = (a > b);
                                     bool is_greater;
 
@@ -202,7 +208,7 @@ void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>
                                 }
                             }
                         }
-                        // 3. Extract exact median
+                        // Extract median
                         out_arr[p] = flat[12];
                     }
                 }
@@ -214,7 +220,7 @@ void kernel2_median_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>
 }
 
 // ---------------------------------------------------------
-// Kernel 3: Bilateral Filter (4x SIMD Vectorized!)
+// Kernel 3: Bilateral Filter
 // ---------------------------------------------------------
 void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>& stream_out) {
     
@@ -232,7 +238,6 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
     #pragma HLS bind_storage variable=line_buf type=ram_t2p impl=bram
     #pragma HLS array_partition variable=line_buf complete dim=1
     
-    // The Wide Window: 5 rows by 12 columns
     pixel_t window[5][12];
     #pragma HLS ARRAY_PARTITION variable=window complete dim=0
 
@@ -245,28 +250,24 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
 
             if (r < HEIGHT && c < WIDTH / 4) new_vec = stream_in.read();
 
-            // 1. Shift the Wide Window left by 4 columns
             for (int i = 0; i < 5; i++) {
                 for (int j = 0; j < 8; j++) {
                     window[i][j] = window[i][j+4];
                 }
             }
 
-            // 2. Read 4 pixels at once from the Wide BRAM
             int c_idx = (c < WIDTH / 4) ? c : (WIDTH / 4) - 1;
             pixel4_t col_val0 = line_buf[0][c_idx];
             pixel4_t col_val1 = line_buf[1][c_idx];
             pixel4_t col_val2 = line_buf[2][c_idx];
             pixel4_t col_val3 = line_buf[3][c_idx];
 
-            // 3. Unpack the new 4-pixel structs into columns 8 through 11
             window[0][8] = col_val0.p0; window[0][9] = col_val0.p1; window[0][10] = col_val0.p2; window[0][11] = col_val0.p3;
             window[1][8] = col_val1.p0; window[1][9] = col_val1.p1; window[1][10] = col_val1.p2; window[1][11] = col_val1.p3;
             window[2][8] = col_val2.p0; window[2][9] = col_val2.p1; window[2][10] = col_val2.p2; window[2][11] = col_val2.p3;
             window[3][8] = col_val3.p0; window[3][9] = col_val3.p1; window[3][10] = col_val3.p2; window[3][11] = col_val3.p3;
             window[4][8] = new_vec.p0;  window[4][9] = new_vec.p1;  window[4][10] = new_vec.p2;  window[4][11] = new_vec.p3;
 
-            // 4. Update the Wide BRAM Line Buffers
             if (c < WIDTH / 4) {
                 line_buf[0][c] = col_val1;
                 line_buf[1][c] = col_val2;
@@ -274,7 +275,6 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
                 line_buf[3][c] = new_vec;
             }
 
-            // 5. Compute exactly 4 Bilaterals Simultaneously
             if (r >= 2 && c >= 1) { 
                 pixel4_t out_vec;
                 pixel_t out_arr[4];
@@ -291,7 +291,6 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
                     } else {
                         int center_val = (int)window[2][p + 4];
                         
-                        // Stage 1: Create arrays to hold the 5 independent row sums
                         int val_row_sum[5] = {0, 0, 0, 0, 0};
                         int weight_row_sum[5] = {0, 0, 0, 0, 0};
                         
@@ -323,12 +322,9 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
                         int val_sum = 0;
                         int weight_sum = 0;
                         
-                        // --- THE SLICE ---
-                        // Force a pipeline register between the row sums and the final total
                         #pragma HLS bind_op variable=val_sum op=add impl=fabric latency=1
                         #pragma HLS bind_op variable=weight_sum op=add impl=fabric latency=1
                         
-                        // Stage 2: Sum the 5 row registers together
                         val_sum = val_row_sum[0] + val_row_sum[1] + val_row_sum[2] + val_row_sum[3] + val_row_sum[4];
                         weight_sum = weight_row_sum[0] + weight_row_sum[1] + weight_row_sum[2] + weight_row_sum[3] + weight_row_sum[4];
 
@@ -348,7 +344,7 @@ void kernel3_bilateral_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4
 }
 
 // ---------------------------------------------------------
-// Kernel 4: Sobel Gradients (4x SIMD Vectorized & Aligned!)
+// Kernel 4: Sobel Gradients
 // ---------------------------------------------------------
 void kernel4_sobel_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>& stream_x, hls::stream<pixel4_t>& stream_y) {
     coef_t sobel_x[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
@@ -360,7 +356,6 @@ void kernel4_sobel_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>&
     #pragma HLS bind_storage variable=line_buf type=ram_t2p impl=bram
     #pragma HLS array_partition variable=line_buf complete dim=1
     
-    // THE FIX: 12-column wide window!
     pixel_t window[3][12];
     #pragma HLS ARRAY_PARTITION variable=window complete dim=0
 
@@ -372,7 +367,6 @@ void kernel4_sobel_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>&
             new_vec.p0 = 0; new_vec.p1 = 0; new_vec.p2 = 0; new_vec.p3 = 0;
             if (r < HEIGHT && c < WIDTH / 4) new_vec = stream_in.read();
 
-            // Shift by 4 columns
             for (int i = 0; i < 3; i++) {
                 for (int j = 0; j < 8; j++) {
                     window[i][j] = window[i][j+4];
@@ -383,7 +377,6 @@ void kernel4_sobel_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>&
             pixel4_t col_val0 = line_buf[0][c_idx];
             pixel4_t col_val1 = line_buf[1][c_idx];
 
-            // Load into 8..11
             window[0][8] = col_val0.p0; window[0][9] = col_val0.p1; window[0][10] = col_val0.p2; window[0][11] = col_val0.p3;
             window[1][8] = col_val1.p0; window[1][9] = col_val1.p1; window[1][10] = col_val1.p2; window[1][11] = col_val1.p3;
             window[2][8] = new_vec.p0;  window[2][9] = new_vec.p1;  window[2][10] = new_vec.p2;  window[2][11] = new_vec.p3;
@@ -427,7 +420,7 @@ void kernel4_sobel_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>&
 }
 
 // ---------------------------------------------------------
-// Kernel 5: Magnitude & Direction (4x SIMD Vectorized!)
+// Kernel 5: Magnitude & Direction
 // ---------------------------------------------------------
 void kernel5_mag_dir_simd(
     hls::stream<pixel4_t>& stream_x, hls::stream<pixel4_t>& stream_y, 
@@ -461,13 +454,10 @@ void kernel5_mag_dir_simd(
             if (curr_gx == 0) {
                 dir = 90; 
             } else {
-                // 1. Force the synthesizer to take 4 cycles for this division!
-                // This breaks the 9ns critical path.
                 calc_t slope;
                 #pragma HLS bind_op variable=slope op=sdiv impl=auto
                 slope = curr_gy / curr_gx; 
 
-                // 2. Let ap_fixed handle the fractions natively at compile time
                 if (slope > (calc_t)-0.414 && slope <= (calc_t)0.414) dir = 0;
                 else if (slope > (calc_t)0.414 && slope <= (calc_t)2.414) dir = 45;
                 else if (slope < (calc_t)-0.414 && slope >= (calc_t)-2.414) dir = 135;
@@ -485,7 +475,7 @@ void kernel5_mag_dir_simd(
 }
 
 // ---------------------------------------------------------
-// Kernel 6: Non-Maximum Suppression (4x SIMD & Aligned!)
+// Kernel 6: Non-Maximum Suppression
 // ---------------------------------------------------------
 void kernel6_nms_simd(hls::stream<pixel4_t>& stream_mag, hls::stream<pixel4_t>& stream_dir, hls::stream<pixel4_t>& stream_out) {
     static pixel4_t mag_buf[2][WIDTH / 4];
@@ -495,7 +485,6 @@ void kernel6_nms_simd(hls::stream<pixel4_t>& stream_mag, hls::stream<pixel4_t>& 
     #pragma HLS ARRAY_PARTITION variable=mag_buf complete dim=1
     #pragma HLS ARRAY_PARTITION variable=dir_buf complete dim=1
 
-    // THE FIX: 12-column wide windows
     pixel_t mag_win[3][12], dir_win[3][12];
     #pragma HLS ARRAY_PARTITION variable=mag_win complete dim=0
     #pragma HLS ARRAY_PARTITION variable=dir_win complete dim=0
@@ -513,7 +502,6 @@ void kernel6_nms_simd(hls::stream<pixel4_t>& stream_mag, hls::stream<pixel4_t>& 
                 new_dir = stream_dir.read();
             }
 
-            // Shift by 4 columns
             for (int i = 0; i < 3; i++) {
                 for (int j = 0; j < 8; j++) {
                     mag_win[i][j] = mag_win[i][j+4];
@@ -525,7 +513,6 @@ void kernel6_nms_simd(hls::stream<pixel4_t>& stream_mag, hls::stream<pixel4_t>& 
             pixel4_t col_m0 = mag_buf[0][c_idx]; pixel4_t col_m1 = mag_buf[1][c_idx];
             pixel4_t col_d0 = dir_buf[0][c_idx]; pixel4_t col_d1 = dir_buf[1][c_idx];
 
-            // Load into 8..11
             mag_win[0][8] = col_m0.p0; mag_win[0][9] = col_m0.p1; mag_win[0][10] = col_m0.p2; mag_win[0][11] = col_m0.p3;
             mag_win[1][8] = col_m1.p0; mag_win[1][9] = col_m1.p1; mag_win[1][10] = col_m1.p2; mag_win[1][11] = col_m1.p3;
             mag_win[2][8] = new_mag.p0; mag_win[2][9] = new_mag.p1; mag_win[2][10] = new_mag.p2; mag_win[2][11] = new_mag.p3;
@@ -550,12 +537,10 @@ void kernel6_nms_simd(hls::stream<pixel4_t>& stream_mag, hls::stream<pixel4_t>& 
                     if (out_r == 0 || out_r == HEIGHT - 1 || out_c == 0 || out_c == WIDTH - 1) {
                         out_arr[p] = 0;
                     } else {
-                        // Center pixel is at p + 4
                         pixel_t mag = mag_win[1][p + 4];
                         pixel_t dir = dir_win[1][p + 4];
                         pixel_t m1 = 0, m2 = 0;
                         
-                        // Neighborhood reaches out to p + 3 (Left) and p + 5 (Right)
                         if (dir == 0)      { m1 = mag_win[1][p + 3]; m2 = mag_win[1][p + 5]; }
                         else if (dir == 90){ m1 = mag_win[0][p + 4]; m2 = mag_win[2][p + 4]; }
                         else if (dir == 45){ m1 = mag_win[2][p + 3]; m2 = mag_win[0][p + 5]; }
@@ -579,7 +564,6 @@ void kernel7_hysteresis_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel
     #pragma HLS bind_storage variable=line_buf type=ram_t2p impl=bram
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
     
-    // 5x12 Wide Window
     pixel_t window[5][12];
     #pragma HLS ARRAY_PARTITION variable=window complete dim=0
 
@@ -622,7 +606,6 @@ void kernel7_hysteresis_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel
                     if (out_r < 2 || out_r >= HEIGHT - 2 || out_c < 2 || out_c >= WIDTH - 2) {
                         out_arr[p] = 0;
                     } else {
-                        // Stage 1: Calculate 5 independent row sums
                         calc_t row_sums[5] = {0, 0, 0, 0, 0};
                         #pragma HLS ARRAY_PARTITION variable=row_sums complete
 
@@ -635,14 +618,10 @@ void kernel7_hysteresis_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel
                         }
                         
                         calc_t local_sum = 0;
-                        // --- THE SLICE ---
-                        // Force a pipeline register to break the 25-element adder path
                         #pragma HLS bind_op variable=local_sum op=add impl=fabric latency=1
                         
-                        // Stage 2: Sum the 5 rows together
                         local_sum = row_sums[0] + row_sums[1] + row_sums[2] + row_sums[3] + row_sums[4];
                         
-                        // Pipeline the division just like we did in Kernel 3 and 5
                         calc_t mean_div;
                         #pragma HLS bind_op variable=mean_div op=sdiv impl=auto
                         mean_div = local_sum / (calc_t)25;
@@ -679,14 +658,13 @@ void kernel7_hysteresis_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel
 
 
 // ---------------------------------------------------------
-// Kernel 8: Morphological Dilation (4x SIMD & Aligned!)
+// Kernel 8: Morphological Dilation
 // ---------------------------------------------------------
 void kernel8_dilation_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_t>& stream_out) {
     static pixel4_t line_buf[2][WIDTH / 4];
     #pragma HLS bind_storage variable=line_buf type=ram_t2p impl=bram
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
     
-    // THE FIX: 12-column wide window!
     pixel_t window[3][12];
     #pragma HLS ARRAY_PARTITION variable=window complete dim=0
 
@@ -698,7 +676,6 @@ void kernel8_dilation_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_
             new_vec.p0 = 0; new_vec.p1 = 0; new_vec.p2 = 0; new_vec.p3 = 0;
             if (r < HEIGHT && c < WIDTH / 4) new_vec = stream_in.read();
 
-            // Shift by 4 columns
             for (int i = 0; i < 3; i++) {
                 for (int j = 0; j < 8; j++) {
                     window[i][j] = window[i][j+4];
@@ -708,7 +685,6 @@ void kernel8_dilation_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_
             int c_idx = (c < WIDTH / 4) ? c : (WIDTH / 4) - 1;
             pixel4_t col0 = line_buf[0][c_idx]; pixel4_t col1 = line_buf[1][c_idx];
 
-            // Load into 8..11
             window[0][8] = col0.p0; window[0][9] = col0.p1; window[0][10] = col0.p2; window[0][11] = col0.p3;
             window[1][8] = col1.p0; window[1][9] = col1.p1; window[1][10] = col1.p2; window[1][11] = col1.p3;
             window[2][8] = new_vec.p0; window[2][9] = new_vec.p1; window[2][10] = new_vec.p2; window[2][11] = new_vec.p3;
@@ -732,7 +708,6 @@ void kernel8_dilation_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_
                         pixel_t max_val = 0;
                         for (int kr = 0; kr < 3; kr++) {
                             for (int kc = 0; kc < 3; kc++) {
-                                // Neighborhood anchored at p + 3
                                 if (window[kr][p + 3 + kc] == 255) max_val = 255;
                             }
                         }
@@ -748,7 +723,7 @@ void kernel8_dilation_simd(hls::stream<pixel4_t>& stream_in, hls::stream<pixel4_
 
 
 // ---------------------------------------------------------
-// Helper: 512-Bit AXI Burst Writer (Takes 4x SIMD Directly!)
+// Helper: 512-Bit AXI Burst Writer
 // ---------------------------------------------------------
 void write_output_burst(hls::stream<pixel4_t>& stream_in, pixel_t img_out[HEIGHT][WIDTH]) {
     super_wide_t *flat_out = (super_wide_t*)img_out;
@@ -758,16 +733,13 @@ void write_output_burst(hls::stream<pixel4_t>& stream_in, pixel_t img_out[HEIGHT
         #pragma HLS PIPELINE II=1
         pixel4_t vec = stream_in.read();
         
-        // Shift existing data right by 64 bits
         chunk = chunk >> 64;
         
-        // ALWAYS insert the new data at the very top 64 bits!
         chunk.range(511, 496) = vec.p3.range();
         chunk.range(495, 480) = vec.p2.range();
         chunk.range(479, 464) = vec.p1.range();
         chunk.range(463, 448) = vec.p0.range();
         
-        // After 8 insertions and shifts, the data is perfectly aligned to write
         if ((i % 8) == 7) {
             flat_out[i / 8] = chunk;
         }
